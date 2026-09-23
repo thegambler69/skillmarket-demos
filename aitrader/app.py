@@ -323,6 +323,8 @@ class LiveGMGN(GMGNAdapter):
             out = subprocess.run(cmd, capture_output=True, text=True, timeout=25, env=self.env)
             if out.returncode != 0: raise RuntimeError(f"gmgn-cli error: {out.stderr.strip()}")
             result = self._check_code(json.loads(out.stdout)); SHARED_GMGN_GUARD.record_success(); return result
+        except RateLimitGuardError:
+            raise
         except Exception as exc:
             SHARED_GMGN_GUARD.record_failure(str(exc)); raise
 
@@ -338,6 +340,8 @@ class LiveGMGN(GMGNAdapter):
             out = subprocess.run(parts, capture_output=True, text=True, timeout=25, env=self.env)
             if out.returncode != 0: raise RuntimeError(f"gmgn-cli error: {out.stderr.strip()}")
             result = self._check_code(json.loads(out.stdout)); SHARED_GMGN_GUARD.record_success(); return result
+        except RateLimitGuardError:
+            raise
         except Exception as exc:
             SHARED_GMGN_GUARD.record_failure(str(exc)); raise
 
@@ -442,6 +446,8 @@ class LiveGMGN(GMGNAdapter):
             out = subprocess.run(["gmgn-cli", "portfolio", "info", "--raw"], capture_output=True, text=True, timeout=25, env=self.env)
             if out.returncode != 0: raise RuntimeError(f"gmgn-cli error: {out.stderr.strip()}")
             data = json.loads(out.stdout); SHARED_GMGN_GUARD.record_success()
+        except RateLimitGuardError:
+            raise
         except Exception as exc:
             SHARED_GMGN_GUARD.record_failure(str(exc)); raise
         for w in data.get("wallets", []):

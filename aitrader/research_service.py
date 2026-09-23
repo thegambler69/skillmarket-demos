@@ -115,6 +115,11 @@ class GMGNResearchService:
                 self._last_errors.pop(cache_key, None)
                 SHARED_GMGN_GUARD.record_success()
                 return result
+            except RateLimitGuardError as exc:
+                self._last_errors[cache_key] = str(exc)
+                if cache_key in self._last_good:
+                    return self._last_good[cache_key]
+                raise
             except Exception as exc:
                 SHARED_GMGN_GUARD.record_failure(str(exc))
                 self._last_errors[cache_key] = str(exc)

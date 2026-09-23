@@ -29,6 +29,10 @@ class GMGNRateLimitGuard:
                 raise RateLimitGuardError("GMGN_RATE_LIMITED", dict(self.state))
     def record_failure(self, message: str):
         text=str(message); limited=bool("429" in text or "rate_limit" in text.lower() or "rate limit" in text.lower())
+        # A locally suppressed request is not a new upstream failure. Never
+        # extend the ban merely because the browser asked for cached data again.
+        if text == "GMGN_RATE_LIMITED":
+            return
         if not limited: return
         with self.lock:
             now=time.time(); match=re.search(r"resets at ([^.;]+)",text,re.I); reset_text=match.group(1).strip() if match else None
