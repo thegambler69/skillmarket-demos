@@ -39,6 +39,7 @@ from research_storage import ResearchStore
 from smart_money_service import SmartMoneyService, SmartMoneyCollector
 from replay_engine import ReplayEngine
 from gmgn_guard import SHARED_GMGN_GUARD, RateLimitGuardError
+from gmgn_scheduler import SHARED_GMGN_SCHEDULER
 
 random.seed(7)
 HERE = pathlib.Path(__file__).resolve().parent
@@ -320,9 +321,8 @@ class LiveGMGN(GMGNAdapter):
         SHARED_GMGN_GUARD.before_request()
         cmd = ["gmgn-cli", *args, "--chain", self.chain, "--raw"]
         try:
-            out = subprocess.run(cmd, capture_output=True, text=True, timeout=25, env=self.env)
-            if out.returncode != 0: raise RuntimeError(f"gmgn-cli error: {out.stderr.strip()}")
-            result = self._check_code(json.loads(out.stdout)); SHARED_GMGN_GUARD.record_success(); return result
+            out = SHARED_GMGN_SCHEDULER.submit(cmd, self.env, key=f"live:{self.chain}:" + " ".join(args), priority=3, category="other", timeout=25)
+            return self._check_code(json.loads(out.stdout))
         except RateLimitGuardError:
             raise
         except Exception as exc:
@@ -337,9 +337,8 @@ class LiveGMGN(GMGNAdapter):
             parts.append("--raw")
         SHARED_GMGN_GUARD.before_request()
         try:
-            out = subprocess.run(parts, capture_output=True, text=True, timeout=25, env=self.env)
-            if out.returncode != 0: raise RuntimeError(f"gmgn-cli error: {out.stderr.strip()}")
-            result = self._check_code(json.loads(out.stdout)); SHARED_GMGN_GUARD.record_success(); return result
+            out = SHARED_GMGN_SCHEDULER.submit(parts, self.env, key=f"custom:{self.chain}:{cmd_str}", priority=2, category="live_market", timeout=25)
+            return self._check_code(json.loads(out.stdout))
         except RateLimitGuardError:
             raise
         except Exception as exc:
@@ -443,9 +442,9 @@ class LiveGMGN(GMGNAdapter):
         # portfolio info 无 --chain 参数：直接调，不经 _cli（_cli 会硬加 --chain）
         SHARED_GMGN_GUARD.before_request()
         try:
-            out = subprocess.run(["gmgn-cli", "portfolio", "info", "--raw"], capture_output=True, text=True, timeout=25, env=self.env)
-            if out.returncode != 0: raise RuntimeError(f"gmgn-cli error: {out.stderr.strip()}")
-            data = json.loads(out.stdout); SHARED_GMGN_GUARD.record_success()
+            out = SHARED_GMGN_SCHEDULER.submit(["gmgn-cli", "portfolio", "info", "--raw"], self.env,
+                key=f"wallet-discovery:{self.chain}", priority=1, category="wallet", timeout=25)
+            data = json.loads(out.stdout)
         except RateLimitGuardError:
             raise
         except Exception as exc:
@@ -2121,9 +2120,13 @@ def smart_status() -> dict:
     # Version is local metadata, not a research request. Cache it so repeated
     # health polling (especially during a ban) never spawns gmgn-cli processes.
     if GMGN_CLI_VERSION is None:
-        try:
-            GMGN_CLI_VERSION = subprocess.run(["gmgn-cli", "--version"], capture_output=True, text=True, timeout=5, check=False).stdout.strip() or "unknown"
-        except Exception: GMGN_CLI_VERSION = "unavailable"
+        if SHARED_GMGN_GUARD.blocked():
+            GMGN_CLI_VERSION = "unknown (rate limited)"
+        else:
+            try:
+                out = SHARED_GMGN_SCHEDULER.submit(["gmgn-cli", "--version"], {**os.environ, **load_env()}, key="cli-version", priority=0, category="other", timeout=5)
+                GMGN_CLI_VERSION = out.stdout.strip() or "unknown"
+            except Exception: GMGN_CLI_VERSION = "unavailable"
     version = GMGN_CLI_VERSION
     db_counts = {**counts, "backtests": len(RESEARCH_STORE.backtest_runs(200))}
     market_error = MARKET_HEALTH.get("last_error")
@@ -2138,7 +2141,8 @@ def smart_status() -> dict:
             "recent_event_count": counts["smart_money_events"], "database": "ok", "database_path": str(RESEARCH_STORE.path), "database_size": RESEARCH_STORE.db_size(), "counts": db_counts,
             "market_collector": {"running": bool(MARKET_COLLECTOR_THREAD and MARKET_COLLECTOR_THREAD.is_alive()), "paused": MARKET_COLLECTOR_PAUSED, "started_at": MARKET_COLLECTOR_STARTED, **MARKET_HEALTH, "last_success": MARKET_HEALTH.get("last_success") or (cache or {}).get("updated_at"), "stale": market_stale, "state": market_state, "next_attempt": (shared_limit.get("next_retry") if shared_limit.get("active") else MARKET_HEALTH.get("next_attempt")), "rate_limit_reset": (shared_limit.get("rate_limit_reset") if shared_limit.get("active") else _retry_metadata(market_error).get("rate_limit_reset"))},
             "smart_money_collector": {"running": bool(SMART_COLLECTOR.thread and SMART_COLLECTOR.thread.is_alive()), "started_at": SMART_COLLECTOR.started_at, "last_attempt": SMART_MONEY.last_attempt, "last_success": SMART_MONEY.last_success or (smart_cache or {}).get("updated_at"), "next_attempt": (shared_limit.get("next_retry") if shared_limit.get("active") else SMART_MONEY.next_attempt), "consecutive_failures": SMART_MONEY.consecutive_failures, "rate_limit_events": SMART_MONEY.rate_limit_events, "last_error": smart_error, "stale": smart_stale, "state": smart_state, "rate_limit_reset": (shared_limit.get("rate_limit_reset") if shared_limit.get("active") else _retry_metadata(smart_error).get("rate_limit_reset"))},
-            "shared_rate_limit": shared_limit, "stale": smart_stale or market_stale, "error": smart_error or market_error, "settings": api_research_settings()}
+            "shared_rate_limit": shared_limit, "request_budget": SHARED_GMGN_SCHEDULER.snapshot(),
+            "stale": smart_stale or market_stale, "error": smart_error or market_error, "settings": api_research_settings()}
 
 @app.get("/api/research/quality")
 def api_research_quality():

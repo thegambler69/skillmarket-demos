@@ -7,6 +7,7 @@ import time
 from collections import defaultdict
 from typing import Any
 from gmgn_guard import SHARED_GMGN_GUARD
+from gmgn_scheduler import SHARED_GMGN_SCHEDULER
 
 
 class SmartMoneyService:
@@ -33,10 +34,11 @@ class SmartMoneyService:
             if isinstance(data, list): return data
         return result if isinstance(result, list) else []
 
-    def _call(self, kind: str, ttl: float = 30.0) -> list[dict[str, Any]]:
+    def _call(self, kind: str, ttl: float = 60.0) -> list[dict[str, Any]]:
         now = time.monotonic()
         cached = self._cache.get(kind)
-        if cached and cached[0] > now: return cached[1]
+        if cached and cached[0] > now:
+            SHARED_GMGN_SCHEDULER.cache_hit(); return cached[1]
         args = ["track", kind, "--chain", "sol", "--limit", "100"]
         result = self.research._call(args, f"track:sol:{kind}", ttl_s=ttl)
         rows = self._rows(result)

@@ -9,12 +9,12 @@ from __future__ import annotations
 import json
 import os
 import re
-import subprocess
 import threading
 import time
 from dataclasses import dataclass
 from typing import Any
 from gmgn_guard import SHARED_GMGN_GUARD, RateLimitGuardError
+from gmgn_scheduler import SHARED_GMGN_SCHEDULER
 
 
 SOL_ADDRESS = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
@@ -93,39 +93,37 @@ class GMGNResearchService:
         with self._lock:
             cached = self._cache.get(cache_key)
             if cached and cached.expires_at > now:
+                SHARED_GMGN_SCHEDULER.cache_hit()
                 return cached.value
-            self._acquire_weight(self._weight(args))
-            wait_for = self.min_request_gap_s - (now - self._last_request)
-            if wait_for > 0:
-                time.sleep(wait_for)
-            self._last_request = time.monotonic()
-            command = ["gmgn-cli", *args, "--raw"]
-            try:
-                SHARED_GMGN_GUARD.before_request()
-                completed = subprocess.run(
-                    command, capture_output=True, text=True, timeout=25, env=self._env(), check=False
-                )
-                if completed.returncode != 0:
-                    raise RuntimeError(completed.stderr.strip() or "gmgn-cli exited unsuccessfully")
-                result = json.loads(completed.stdout)
-                if isinstance(result, dict) and result.get("code") not in (None, 0):
-                    raise RuntimeError(result.get("message") or result.get("error") or "GMGN returned an error")
+            if SHARED_GMGN_GUARD.blocked():
+                self._last_errors[cache_key] = "GMGN_RATE_LIMITED"
+                if cache_key in self._last_good:
+                    return self._last_good[cache_key]
+                raise RateLimitGuardError("GMGN_RATE_LIMITED", SHARED_GMGN_GUARD.snapshot())
+        command = ["gmgn-cli", *args, "--raw"]
+        route = tuple(args[:2])
+        category = "live_market" if route == ("market", "trending") else ("token_inspector" if route[0:1] == ("token",) else ("wallet" if route[0:1] == ("portfolio",) else "other"))
+        priority = 2 if category == "live_market" else (1 if category in {"token_inspector", "wallet"} else 3)
+        try:
+            completed = SHARED_GMGN_SCHEDULER.submit(command, self._env(), key=cache_key, priority=priority, category=category, timeout=25)
+            result = json.loads(completed.stdout)
+            if isinstance(result, dict) and result.get("code") not in (None, 0):
+                raise RuntimeError(result.get("message") or result.get("error") or "GMGN returned an error")
+            with self._lock:
                 self._cache[cache_key] = CachedValue(result, time.monotonic() + ttl)
                 self._last_good[cache_key] = result
                 self._last_errors.pop(cache_key, None)
-                SHARED_GMGN_GUARD.record_success()
-                return result
-            except RateLimitGuardError as exc:
+            return result
+        except RateLimitGuardError as exc:
+            with self._lock:
                 self._last_errors[cache_key] = str(exc)
-                if cache_key in self._last_good:
-                    return self._last_good[cache_key]
-                raise
-            except Exception as exc:
-                SHARED_GMGN_GUARD.record_failure(str(exc))
+                if cache_key in self._last_good: return self._last_good[cache_key]
+            raise
+        except Exception as exc:
+            with self._lock:
                 self._last_errors[cache_key] = str(exc)
-                if cache_key in self._last_good:
-                    return self._last_good[cache_key]
-                raise
+                if cache_key in self._last_good: return self._last_good[cache_key]
+            raise
 
     def last_error(self, cache_key: str) -> str | None:
         with self._lock: return self._last_errors.get(cache_key)
@@ -137,7 +135,7 @@ class GMGNResearchService:
     def trending_sol(self, limit: int = 50) -> list[dict[str, Any]]:
         result = self._call(
             ["market", "trending", "--chain", "sol", "--interval", "1h", "--order-by", "volume", "--limit", str(limit)],
-            "trending:sol:1h", ttl_s=10,
+            "trending:sol:1h", ttl_s=25,
         )
         return self._data(result).get("rank") or []
 
@@ -145,10 +143,10 @@ class GMGNResearchService:
         address = self.validate_sol_address(address)
         prefix = f"token:sol:{address}"
         info = self._data(self._call(["token", "info", "--chain", "sol", "--address", address], prefix + ":info", 30))
-        security = self._data(self._call(["token", "security", "--chain", "sol", "--address", address], prefix + ":security", 30))
-        pool = self._data(self._call(["token", "pool", "--chain", "sol", "--address", address], prefix + ":pool", 45))
+        security = self._data(self._call(["token", "security", "--chain", "sol", "--address", address], prefix + ":security", 60))
+        pool = self._data(self._call(["token", "pool", "--chain", "sol", "--address", address], prefix + ":pool", 30))
         holders = self._data(self._call(["token", "holders", "--chain", "sol", "--address", address, "--limit", "20"], prefix + ":holders", 60)).get("list") or []
-        traders = self._data(self._call(["token", "traders", "--chain", "sol", "--address", address, "--limit", "20"], prefix + ":traders", 60)).get("list") or []
+        traders = self._data(self._call(["token", "traders", "--chain", "sol", "--address", address, "--limit", "20"], prefix + ":traders", 45)).get("list") or []
         return {"info": info, "security": security, "pool": pool, "holders": holders, "traders": traders}
 
 
