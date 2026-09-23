@@ -163,7 +163,14 @@ class SmartMoneyCollector:
     def _run(self):
         self.started_at = int(time.time()); failures = 0
         while not self.stop.is_set():
-            result = self.service.collect_once(); failures = self.service.consecutive_failures
-            base = max(10, int(self.interval_getter() or 60)); delay = min(base * (2 ** min(failures, 5)), 1800)
+            try:
+                self.service.collect_once(); failures = self.service.consecutive_failures
+                base = max(10, int(self.interval_getter() or 60))
+            except Exception as exc:
+                failures += 1
+                self.service.last_error = str(exc); self.service.stale = True
+                self.service.consecutive_failures = failures
+                base = 60
+            delay = min(base * (2 ** min(failures, 5)), 1800)
             self.service.next_attempt = int(time.time() + delay)
             self.stop.wait(delay)

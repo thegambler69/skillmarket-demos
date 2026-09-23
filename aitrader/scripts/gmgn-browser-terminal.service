@@ -8,7 +8,9 @@ WorkingDirectory=%h/gmgn-demos/aitrader
 ExecStart=%h/gmgn-demos/aitrader/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 8011
 Restart=on-failure
 RestartSec=10
+LimitNOFILE=8192
 Environment=PYTHONUNBUFFERED=1
+Environment=PATH=%h/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 [Install]
 WantedBy=default.target
