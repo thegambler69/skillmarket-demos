@@ -102,7 +102,16 @@ class GMGNResearchService:
                 raise RateLimitGuardError("GMGN_RATE_LIMITED", SHARED_GMGN_GUARD.snapshot())
         command = ["gmgn-cli", *args, "--raw"]
         route = tuple(args[:2])
-        category = "live_market" if route == ("market", "trending") else ("token_inspector" if route[0:1] == ("token",) else ("wallet" if route[0:1] == ("portfolio",) else "other"))
+        if route == ("market", "trending"):
+            category = "live_market"
+        elif route[0:1] == ("token",):
+            category = "token_inspector"
+        elif route[0:1] == ("portfolio",):
+            category = "wallet"
+        elif route[0:1] == ("track",):
+            category = "smart_money" if route[1:2] == ("smartmoney",) else "kol"
+        else:
+            category = "other"
         priority = 2 if category == "live_market" else (1 if category in {"token_inspector", "wallet"} else 3)
         try:
             completed = SHARED_GMGN_SCHEDULER.submit(command, self._env(), key=cache_key, priority=priority, category=category, timeout=25)
