@@ -14,6 +14,7 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Any
+from gmgn_guard import SHARED_GMGN_GUARD, RateLimitGuardError
 
 
 SOL_ADDRESS = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
@@ -100,6 +101,7 @@ class GMGNResearchService:
             self._last_request = time.monotonic()
             command = ["gmgn-cli", *args, "--raw"]
             try:
+                SHARED_GMGN_GUARD.before_request()
                 completed = subprocess.run(
                     command, capture_output=True, text=True, timeout=25, env=self._env(), check=False
                 )
@@ -111,8 +113,10 @@ class GMGNResearchService:
                 self._cache[cache_key] = CachedValue(result, time.monotonic() + ttl)
                 self._last_good[cache_key] = result
                 self._last_errors.pop(cache_key, None)
+                SHARED_GMGN_GUARD.record_success()
                 return result
             except Exception as exc:
+                SHARED_GMGN_GUARD.record_failure(str(exc))
                 self._last_errors[cache_key] = str(exc)
                 if cache_key in self._last_good:
                     return self._last_good[cache_key]

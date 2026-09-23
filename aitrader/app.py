@@ -38,6 +38,7 @@ from research_signals import derive_signals
 from research_storage import ResearchStore
 from smart_money_service import SmartMoneyService, SmartMoneyCollector
 from replay_engine import ReplayEngine
+from gmgn_guard import SHARED_GMGN_GUARD, RateLimitGuardError
 
 random.seed(7)
 HERE = pathlib.Path(__file__).resolve().parent
@@ -230,6 +231,7 @@ MARKET_HEALTH = {"last_attempt": None, "last_success": None, "consecutive_failur
 MARKET_COLLECTOR_STOP = threading.Event()
 MARKET_COLLECTOR_THREAD = None
 MARKET_COLLECTOR_STARTED = None
+GMGN_CLI_VERSION: str | None = None
 MARKET_COLLECTOR_PAUSED = False
 
 def _retry_metadata(error: str | None) -> dict:
@@ -245,10 +247,28 @@ def _state_label(stale: bool, error: str | None, paused: bool = False) -> str:
     if error: return "DISCONNECTED"
     return "LIVE"
 
+def _guard_state() -> dict:
+    state = SHARED_GMGN_GUARD.snapshot(); now = int(time.time())
+    state["active"] = int(state.get("banned_until", 0) or 0) > now
+    state["remaining_seconds"] = max(0, int(state.get("banned_until", 0) or 0) - now)
+    return state
+
+def _rate_limit_http(detail: str = "GMGN is rate limited; cached data is being served."):
+    state = _guard_state(); reset = state.get("rate_limit_reset") or "unknown"
+    raise HTTPException(429, {"state":"RATE_LIMITED", "message":detail, "reset_at":reset, "retry_at":state.get("next_retry"), "remaining_seconds":state.get("remaining_seconds",0)})
+
 def _market_collector_loop():
     global MARKET_COLLECTOR_STARTED
     MARKET_COLLECTOR_STARTED = int(time.time()); delay = 30
     while not MARKET_COLLECTOR_STOP.is_set():
+        guard = _guard_state()
+        if guard.get("active"):
+            # Do not even enter the research endpoint during a persisted ban;
+            # the next attempt is scheduled at the guard's retry boundary.
+            delay = max(1, int(guard.get("remaining_seconds") or 1))
+            MARKET_HEALTH["next_attempt"] = int(time.time() + delay)
+            MARKET_COLLECTOR_STOP.wait(delay)
+            continue
         if not MARKET_COLLECTOR_PAUSED:
             try:
                 api_research_live_market(50); delay = 30 if MARKET_HEALTH["consecutive_failures"] == 0 else min(delay * 2, 1800)
@@ -297,12 +317,14 @@ class LiveGMGN(GMGNAdapter):
         return resp
 
     def _cli(self, *args) -> dict:
+        SHARED_GMGN_GUARD.before_request()
         cmd = ["gmgn-cli", *args, "--chain", self.chain, "--raw"]
-        out = subprocess.run(cmd, capture_output=True, text=True,
-                             timeout=25, env=self.env)
-        if out.returncode != 0:
-            raise RuntimeError(f"gmgn-cli error: {out.stderr.strip()}")
-        return self._check_code(json.loads(out.stdout))
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=25, env=self.env)
+            if out.returncode != 0: raise RuntimeError(f"gmgn-cli error: {out.stderr.strip()}")
+            result = self._check_code(json.loads(out.stdout)); SHARED_GMGN_GUARD.record_success(); return result
+        except Exception as exc:
+            SHARED_GMGN_GUARD.record_failure(str(exc)); raise
 
     def _run_cmd(self, cmd_str: str) -> dict:
         """执行用户自定义的完整 gmgn-cli 命令（不经 shell，避免注入扩大）。"""
@@ -311,10 +333,13 @@ class LiveGMGN(GMGNAdapter):
             raise RuntimeError("命令必须以 gmgn-cli 开头")
         if "--raw" not in parts:
             parts.append("--raw")
-        out = subprocess.run(parts, capture_output=True, text=True, timeout=25, env=self.env)
-        if out.returncode != 0:
-            raise RuntimeError(f"gmgn-cli error: {out.stderr.strip()}")
-        return self._check_code(json.loads(out.stdout))
+        SHARED_GMGN_GUARD.before_request()
+        try:
+            out = subprocess.run(parts, capture_output=True, text=True, timeout=25, env=self.env)
+            if out.returncode != 0: raise RuntimeError(f"gmgn-cli error: {out.stderr.strip()}")
+            result = self._check_code(json.loads(out.stdout)); SHARED_GMGN_GUARD.record_success(); return result
+        except Exception as exc:
+            SHARED_GMGN_GUARD.record_failure(str(exc)); raise
 
     def market_trending(self, cmd=None, interval="1h", orderby="volume", limit=100,
                         filters=("not_wash_trading",)):
@@ -412,11 +437,13 @@ class LiveGMGN(GMGNAdapter):
         if self.chain in self._wallet_cache:
             return self._wallet_cache[self.chain]
         # portfolio info 无 --chain 参数：直接调，不经 _cli（_cli 会硬加 --chain）
-        out = subprocess.run(["gmgn-cli", "portfolio", "info", "--raw"],
-                             capture_output=True, text=True, timeout=25, env=self.env)
-        if out.returncode != 0:
-            raise RuntimeError(f"gmgn-cli error: {out.stderr.strip()}")
-        data = json.loads(out.stdout)
+        SHARED_GMGN_GUARD.before_request()
+        try:
+            out = subprocess.run(["gmgn-cli", "portfolio", "info", "--raw"], capture_output=True, text=True, timeout=25, env=self.env)
+            if out.returncode != 0: raise RuntimeError(f"gmgn-cli error: {out.stderr.strip()}")
+            data = json.loads(out.stdout); SHARED_GMGN_GUARD.record_success()
+        except Exception as exc:
+            SHARED_GMGN_GUARD.record_failure(str(exc)); raise
         for w in data.get("wallets", []):
             if w.get("chain") == self.chain and w.get("address"):
                 self._wallet_cache[self.chain] = w["address"]
@@ -1936,6 +1963,8 @@ def api_run(r: RunIn):
             # 后台首轮还没跑完：返回空列表占位（前端继续轮询即可），不报错。
             return JSONResponse(dict(decisions=[], portfolio=None, positions=[]))
         return JSONResponse(data)
+    if ST.is_live_adapter and SHARED_GMGN_GUARD.blocked():
+        _rate_limit_http("Live screening is temporarily unavailable; cached research remains available.")
     ch = valid_chain(r.chain)
     with ST.lock:
         try:
@@ -1986,13 +2015,22 @@ def api_research_live_market(limit: int = 50):
 
 @app.post("/api/research/token-inspector")
 def api_research_token_inspector(request: TokenInspectIn):
+    address = request.address.strip()
+    cached_inspect = RESEARCH_STORE.load_cache(f"token-inspect:sol:{address}")
+    if SHARED_GMGN_GUARD.blocked():
+        if cached_inspect:
+            return {**cached_inspect["payload"], "stale": True, "state": "RATE_LIMITED", "last_success_timestamp": cached_inspect["updated_at"], "rate_limit": _guard_state()}
+        _rate_limit_http("Token Inspector is temporarily unavailable; no cached token inspection exists.")
     try:
-        address = RESEARCH.validate_sol_address(request.address)
+        address = RESEARCH.validate_sol_address(address)
         result = RESEARCH.inspect_sol(address)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     except Exception as exc:
-        raise HTTPException(502, f"Token inspection failed: {exc}")
+        if SHARED_GMGN_GUARD.blocked() or "429" in str(exc) or "RATE_LIMITED" in str(exc):
+            if cached_inspect: return {**cached_inspect["payload"], "stale": True, "state": "RATE_LIMITED", "last_success_timestamp": cached_inspect["updated_at"], "rate_limit": _guard_state()}
+            _rate_limit_http("Token Inspector is temporarily unavailable; no cached token inspection exists.")
+        raise HTTPException(502, "Token inspection is temporarily unavailable.")
     info, security = result["info"], result["security"]
     risk = deterministic_risk(info, security)
     previous = RESEARCH_STORE.security_state("sol", address)
@@ -2007,10 +2045,12 @@ def api_research_token_inspector(request: TokenInspectIn):
                 "symbol": info.get("symbol") or "?", "event_type": "SECURITY_DEGRADATION",
                 "severity": "critical", "details": {"before": previous, "after": state}})
     RESEARCH_STORE.save_security_state("sol", address, state)
-    return {"chain": "sol", "address": address, **result, "risk": risk,
+    payload = {"chain": "sol", "address": address, **result, "risk": risk,
             "smart_money_activity": RESEARCH_STORE.smart_money_events("sol", 100, address),
             "wallet_clusters": RESEARCH_STORE.wallet_clusters("sol", address, 100),
-            "lifecycle": RESEARCH_STORE.lifecycle("sol", address)}
+            "lifecycle": RESEARCH_STORE.lifecycle("sol", address), "stale": False, "state": "LIVE"}
+    RESEARCH_STORE.save_cache(f"token-inspect:sol:{address}", payload, int(time.time()), False, None)
+    return payload
 
 @app.get("/api/research/lifecycle")
 def api_research_lifecycle(address: str, chain: str = "sol"):
@@ -2033,6 +2073,11 @@ def api_research_smart_money(limit: int = 100, token: str | None = None):
 @app.post("/api/research/smart-money/collect")
 def api_research_smart_money_collect():
     # Explicitly read-only: this calls only track smartmoney/kol commands.
+    if SHARED_GMGN_GUARD.blocked():
+        cached = RESEARCH_STORE.load_cache("smart_money_events")
+        return {"events": len((cached or {}).get("payload", [])), "clusters": len(RESEARCH_STORE.wallet_clusters("sol", None, 100)),
+                "stale": True, "state": "RATE_LIMITED", "last_success_timestamp": (cached or {}).get("updated_at"),
+                "rate_limit": _guard_state()}
     return SMART_MONEY.collect_once(force=True)
 
 @app.get("/api/research/settings")
@@ -2060,12 +2105,17 @@ def api_research_health():
     return smart_status()
 
 def smart_status() -> dict:
+    global GMGN_CLI_VERSION
     counts = RESEARCH_STORE.counts()
     cache = RESEARCH_STORE.load_cache("live_market")
     smart_cache = RESEARCH_STORE.load_cache("smart_money_events")
-    try:
-        version = subprocess.run(["gmgn-cli", "--version"], capture_output=True, text=True, timeout=5, check=False).stdout.strip() or "unknown"
-    except Exception: version = "unavailable"
+    # Version is local metadata, not a research request. Cache it so repeated
+    # health polling (especially during a ban) never spawns gmgn-cli processes.
+    if GMGN_CLI_VERSION is None:
+        try:
+            GMGN_CLI_VERSION = subprocess.run(["gmgn-cli", "--version"], capture_output=True, text=True, timeout=5, check=False).stdout.strip() or "unknown"
+        except Exception: GMGN_CLI_VERSION = "unavailable"
+    version = GMGN_CLI_VERSION
     db_counts = {**counts, "backtests": len(RESEARCH_STORE.backtest_runs(200))}
     market_error = MARKET_HEALTH.get("last_error")
     smart_error = SMART_MONEY.last_error
@@ -2075,7 +2125,7 @@ def smart_status() -> dict:
             "recent_event_count": counts["smart_money_events"], "database": "ok", "database_path": str(RESEARCH_STORE.path), "database_size": RESEARCH_STORE.db_size(), "counts": db_counts,
             "market_collector": {"running": bool(MARKET_COLLECTOR_THREAD and MARKET_COLLECTOR_THREAD.is_alive()), "paused": MARKET_COLLECTOR_PAUSED, "started_at": MARKET_COLLECTOR_STARTED, **MARKET_HEALTH, "last_success": MARKET_HEALTH.get("last_success") or (cache or {}).get("updated_at"), "stale": bool(market_error or (cache and cache.get("stale"))), "state": _state_label(bool(market_error or (cache and cache.get("stale"))), market_error, MARKET_COLLECTOR_PAUSED), **_retry_metadata(market_error)},
             "smart_money_collector": {"running": bool(SMART_COLLECTOR.thread and SMART_COLLECTOR.thread.is_alive()), "started_at": SMART_COLLECTOR.started_at, "last_attempt": SMART_MONEY.last_attempt, "last_success": SMART_MONEY.last_success or (smart_cache or {}).get("updated_at"), "next_attempt": SMART_MONEY.next_attempt, "consecutive_failures": SMART_MONEY.consecutive_failures, "rate_limit_events": SMART_MONEY.rate_limit_events, "last_error": smart_error, "stale": SMART_MONEY.stale, "state": _state_label(SMART_MONEY.stale, smart_error), **_retry_metadata(smart_error)},
-            "stale": SMART_MONEY.stale or bool(market_error or (cache and cache.get("stale"))), "error": smart_error or market_error, "settings": api_research_settings()}
+            "shared_rate_limit": _guard_state(), "stale": SMART_MONEY.stale or bool(market_error or (cache and cache.get("stale"))), "error": smart_error or market_error, "settings": api_research_settings()}
 
 @app.get("/api/research/quality")
 def api_research_quality():
@@ -2202,11 +2252,21 @@ def api_wallet(w: WalletIn):
     cached_wallet = RESEARCH_STORE.wallet_evaluation(addr, ch)
     if cached_wallet and int(time.time()) - int(cached_wallet["last_evaluated"]) < 300:
         return JSONResponse(cached_wallet["result"])
+    # During an upstream ban, an older persisted evaluation is still useful and
+    # must be served rather than triggering a fresh CLI request.
+    if cached_wallet and SHARED_GMGN_GUARD.blocked():
+        cached = dict(cached_wallet["result"] or {})
+        cached.update(stale=True, state="RATE_LIMITED", last_evaluated=cached_wallet["last_evaluated"],
+                      rate_limit=_guard_state())
+        return JSONResponse(cached)
+    if SHARED_GMGN_GUARD.blocked():
+        _rate_limit_http("Wallet evaluation is temporarily unavailable; no fresh cached evaluation exists.")
     g = ST.adapter_for(ch)
     try:
         raw_stats = g.portfolio_stats(addr)
     except Exception as e:
-        raise HTTPException(502, f"查询钱包统计失败：{e}")
+        if SHARED_GMGN_GUARD.blocked() or "429" in str(e): _rate_limit_http("Wallet evaluation is temporarily unavailable; cached history remains available.")
+        raise HTTPException(502, "Wallet evaluation is temporarily unavailable.")
     stats = _norm_wallet_stats(raw_stats)
     try:
         summ = _activity_summary(_sample_activity(g, addr, w.sample))
@@ -2277,6 +2337,8 @@ def api_unmonitor(s: SellIn):
 def api_positions(chain: str = "sol"):
     if PUBLIC_DEMO:                       # 公开页不广播本机持仓
         return dict(positions=[], portfolio=None)
+    if ST.is_live_adapter and SHARED_GMGN_GUARD.blocked():
+        _rate_limit_http("Position monitoring is temporarily unavailable; cached research data remains available.")
     ch = valid_chain(chain)
     with ST.lock:
         return dict(positions=monitor_positions(ch), portfolio=_portfolio())

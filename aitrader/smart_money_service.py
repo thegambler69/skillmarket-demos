@@ -6,6 +6,7 @@ import threading
 import time
 from collections import defaultdict
 from typing import Any
+from gmgn_guard import SHARED_GMGN_GUARD
 
 
 class SmartMoneyService:
@@ -163,6 +164,12 @@ class SmartMoneyCollector:
     def _run(self):
         self.started_at = int(time.time()); failures = 0
         while not self.stop.is_set():
+            guard = SHARED_GMGN_GUARD.snapshot()
+            banned_until = float(guard.get("banned_until", 0) or 0)
+            if banned_until > time.time():
+                self.service.next_attempt = int(banned_until)
+                self.stop.wait(max(1, int(banned_until - time.time())))
+                continue
             try:
                 self.service.collect_once(); failures = self.service.consecutive_failures
                 base = max(10, int(self.interval_getter() or 60))
