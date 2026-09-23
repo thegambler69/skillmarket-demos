@@ -404,6 +404,7 @@ td{padding:5px 10px;vertical-align:middle}
         <button id="tabLive" onclick="switchView('live')">LIVE MARKET</button>
         <button id="tabInspector" onclick="switchView('inspector')">TOKEN INSPECTOR</button>
         <button id="tabSmart" onclick="switchView('smart')">SMART MONEY</button>
+        <button id="tabReplay" onclick="switchView('replay')">REPLAY / BACKTEST</button>
         <button id="tabWallet" onclick="switchView('wallet')" data-i18n="tab_wallet">钱包评估</button>
       </div>
     </div>
@@ -487,6 +488,12 @@ td{padding:5px 10px;vertical-align:middle}
     <div id="smartStatus" class="lifecycle">Collector starting…</div>
     <div class="smart-settings"><label>Poll <input id="smPoll" type="number" min="10" value="60">s</label><label>Min score <input id="smScore" type="number" min="0" max="100" value="70"></label><label>Cluster wallets <input id="smCluster" type="number" min="2" value="3"></label><label>Window <input id="smWindow" type="number" min="30" value="1800">s</label><label>Max wallets <input id="smMax" type="number" min="1" value="100"></label><button class="research-go" onclick="saveSmartSettings()">Save settings</button></div>
     <div id="smartResult" class="wlt-empty">Open this tab to load shared Smart Money activity.</div>
+  </div></div>
+  <div id="viewReplay" class="view" style="display:none"><div class="research">
+    <div class="research-head"><h2>Replay / Backtest</h2><span class="research-note">SQLite-only historical replay · rules v1 · no GMGN calls</span></div>
+    <div class="smart-settings"><label>From <input id="rpFrom" type="datetime-local"></label><label>To <input id="rpTo" type="datetime-local"></label><label>Signal <select id="rpSignal"><option value="">Any</option><option>FIRST_SEEN</option><option>SMART_MONEY_ENTRY</option><option>KOL_ENTRY</option><option>WALLET_CLUSTER_ENTRY</option><option>SCORE_JUMP</option><option>MC_CROSS</option></select></label><label>Min priority <input id="rpPriority" type="number" value="0"></label><label>Min SM <input id="rpSm" type="number" value="0"></label><label>Min liquidity <input id="rpLiq" type="number" value="0"></label><label>Max bundler <input id="rpBund" type="number" step=".01" value="1"></label><button class="research-go" onclick="runReplay()">Replay</button><button class="research-go" onclick="runBacktest()">Backtest</button></div>
+    <div class="smart-settings"><label>Entry signals <input id="btSignals" value="FIRST_SEEN,SMART_MONEY_ENTRY,WALLET_CLUSTER_ENTRY"></label><label>Speed <select id="rpSpeed"><option value="1">1x</option><option value="5">5x</option><option value="20">20x</option><option value="100">100x</option></select></label><button class="research-go" onclick="stepReplay()">Step</button><button class="research-go" onclick="toggleReplay()">Play / Pause</button><a class="research-go" href="/api/research/signal-performance.csv">Signal CSV</a><a class="research-go" href="/api/research/strategy-results.csv">Strategy CSV</a></div>
+    <div id="replayStatus" class="lifecycle">No replay loaded.</div><div id="replayResult" class="wlt-empty">Select a range and run replay or backtest.</div>
   </div></div>
 </div>
 
@@ -1742,6 +1749,7 @@ function detectAddrChain(a){
 }
 let liveMarketTimer=null;
 let smartMoneyTimer=null;
+let replayState={events:[],index:0,playing:false,timer:null};
 const rNum=v=>Number(v||0);
 const rPct=v=>(rNum(v)*100).toFixed(1)+'%';
 const rAge=s=>{s=rNum(s);if(s>=86400)return Math.floor(s/86400)+'d';if(s>=3600)return Math.floor(s/3600)+'h';return Math.max(0,Math.floor(s/60))+'m';};
@@ -1776,6 +1784,12 @@ async function loadSmartMoney(manual=false){
 async function collectSmart(manual=false){try{const r=await fetch(API+'/api/research/smart-money/collect',{method:'POST'});if(!r.ok)throw new Error('HTTP '+r.status);await loadSmartMoney(true);}catch(e){if(manual)toast(e.message,'err');}}
 async function saveSmartSettings(){const body={smart_money_poll_interval:+document.getElementById('smPoll').value,min_wallet_score:+document.getElementById('smScore').value,cluster_min_wallets:+document.getElementById('smCluster').value,cluster_window_seconds:+document.getElementById('smWindow').value,max_tracked_wallets:+document.getElementById('smMax').value};try{const r=await fetch(API+'/api/research/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!r.ok)throw new Error('HTTP '+r.status);toast('Smart Money settings saved','ok');}catch(e){toast(e.message,'err');}}
 async function loadSmartSettings(){try{const d=await (await fetch(API+'/api/research/settings')).json();document.getElementById('smPoll').value=d.smart_money_poll_interval;document.getElementById('smScore').value=d.min_wallet_score;document.getElementById('smCluster').value=d.cluster_min_wallets;document.getElementById('smWindow').value=d.cluster_window_seconds;document.getElementById('smMax').value=d.max_tracked_wallets;}catch(_){} }
+function replayConfig(){const ts=id=>{const v=document.getElementById(id).value;return v?Math.floor(new Date(v).getTime()/1000):null};return {chain:'sol',start_ts:ts('rpFrom'),end_ts:ts('rpTo'),signal_type:document.getElementById('rpSignal').value||null,min_priority_score:+document.getElementById('rpPriority').value||0,min_smart_money_count:+document.getElementById('rpSm').value||0,min_liquidity:+document.getElementById('rpLiq').value||0,max_bundler_pct:+document.getElementById('rpBund').value,entry_signals:document.getElementById('btSignals').value.split(',').map(x=>x.trim()).filter(Boolean)};}
+async function runReplay(){try{const r=await fetch(API+'/api/research/replay',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(replayConfig())});if(!r.ok)throw new Error('HTTP '+r.status);const d=await r.json();replayState={events:d.events||[],index:0,playing:false,timer:null};renderReplay();}catch(e){toast(e.message,'err');}}
+function renderReplay(){const e=replayState.events[replayState.index-1];document.getElementById('replayStatus').textContent=`${replayState.index}/${replayState.events.length} · simulated clock: ${e?new Date(e.timestamp*1000).toLocaleString():'—'}`;const rows=replayState.events.slice(Math.max(0,replayState.index-20),replayState.index).reverse().map(x=>`<tr><td>${new Date(x.timestamp*1000).toLocaleString()}</td><td>${rEsc(x.kind)}</td><td>${rEsc(x.event_type||'snapshot')}</td><td>${rEsc(x.symbol||'?')}</td><td>${rEsc(shortCA(x.token_address))}</td></tr>`).join('');document.getElementById('replayResult').innerHTML=`<div class="research-table"><table><thead><tr><th>Timestamp</th><th>Kind</th><th>Event</th><th>Token</th><th>Address</th></tr></thead><tbody>${rows||'<tr><td colspan="5">No historical events.</td></tr>'}</tbody></table></div>`;}
+function stepReplay(){if(replayState.index<replayState.events.length){replayState.index++;renderReplay();}}
+function toggleReplay(){replayState.playing=!replayState.playing;if(replayState.playing){const speed=+(document.getElementById('rpSpeed').value||1);replayState.timer=setInterval(()=>{if(replayState.index>=replayState.events.length){replayState.playing=false;clearInterval(replayState.timer);return;}stepReplay();},Math.max(20,500/speed));}else clearInterval(replayState.timer);}
+async function runBacktest(){try{const r=await fetch(API+'/api/research/backtest',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(replayConfig())});if(!r.ok)throw new Error('HTTP '+r.status);const d=await r.json(),m=d.result||{};document.getElementById('replayStatus').textContent=`Run ${d.run_id} · signals ${m.number_signals||0} · valid ${m.valid_entries||0} · incomplete ${m.incomplete||0}`;document.getElementById('replayResult').innerHTML='<pre>'+rEsc(JSON.stringify(m,null,2))+'</pre>'; }catch(e){toast(e.message,'err');}}
 function openTokenDetail(address){const input=document.getElementById('inspectAddr');if(input)input.value=address;switchView('inspector');inspectToken();}
 async function inspectToken(){
   const address=(document.getElementById('inspectAddr').value||'').trim();
@@ -1803,11 +1817,13 @@ function switchView(v){
   document.getElementById('tabLive').classList.toggle('on',v==='live');
   document.getElementById('tabInspector').classList.toggle('on',v==='inspector');
   document.getElementById('tabSmart').classList.toggle('on',v==='smart');
+  document.getElementById('tabReplay').classList.toggle('on',v==='replay');
   document.getElementById('tabWallet').classList.toggle('on',v==='wallet');
   document.getElementById('viewToken').style.display=v==='token'?'flex':'none';
   document.getElementById('viewLive').style.display=v==='live'?'block':'none';
   document.getElementById('viewInspector').style.display=v==='inspector'?'block':'none';
   document.getElementById('viewSmart').style.display=v==='smart'?'block':'none';
+  document.getElementById('viewReplay').style.display=v==='replay'?'block':'none';
   document.getElementById('viewWallet').style.display=v==='wallet'?'block':'none';
   if(v==='live'){loadLiveMarket();if(!liveMarketTimer)liveMarketTimer=setInterval(()=>{if(!document.hidden&&curView==='live')loadLiveMarket();},15000);}
   if(v==='wallet'){const a=document.getElementById('wltAddr');if(a)a.focus();}

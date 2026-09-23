@@ -154,6 +154,41 @@ class ResearchStore:
                   key TEXT PRIMARY KEY,
                   value_json TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS strategy_definitions (
+                  id INTEGER PRIMARY KEY,
+                  name TEXT NOT NULL,
+                  config_json TEXT NOT NULL,
+                  priority_score_version TEXT NOT NULL,
+                  signal_rules_version TEXT NOT NULL,
+                  risk_rules_version TEXT NOT NULL,
+                  created_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS backtest_runs (
+                  id INTEGER PRIMARY KEY,
+                  created_at INTEGER NOT NULL,
+                  strategy_config_json TEXT NOT NULL,
+                  start_ts INTEGER,
+                  end_ts INTEGER,
+                  priority_score_version TEXT NOT NULL,
+                  signal_rules_version TEXT NOT NULL,
+                  risk_rules_version TEXT NOT NULL,
+                  sample_size INTEGER NOT NULL,
+                  result_json TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS backtest_trades (
+                  id INTEGER PRIMARY KEY,
+                  run_id INTEGER NOT NULL,
+                  token_address TEXT NOT NULL,
+                  symbol TEXT,
+                  signal_type TEXT,
+                  entry_timestamp INTEGER NOT NULL,
+                  entry_price REAL,
+                  entry_market_cap REAL,
+                  outcome_json TEXT NOT NULL,
+                  FOREIGN KEY(run_id) REFERENCES backtest_runs(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_backtest_trades_run ON backtest_trades(run_id, entry_timestamp);
+                CREATE INDEX IF NOT EXISTS idx_backtest_runs_created ON backtest_runs(created_at DESC);
                 """
             )
             # Small forward-only migration: rank is retained to highlight material
@@ -355,3 +390,47 @@ class ResearchStore:
     def counts(self) -> dict[str, int]:
         with self._lock, self._connect() as conn:
             return {name: int(conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]) for name in ("token_snapshots", "research_signals", "smart_money_events", "tracked_wallets", "wallet_clusters")}
+
+    def historical_snapshots(self, chain: str = "sol", address: str | None = None,
+                             start_ts: int | None = None, end_ts: int | None = None) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM token_snapshots WHERE chain=?"; args: list[Any] = [chain]
+        if address: sql += " AND address=?"; args.append(address)
+        if start_ts is not None: sql += " AND timestamp>=?"; args.append(int(start_ts))
+        if end_ts is not None: sql += " AND timestamp<=?"; args.append(int(end_ts))
+        sql += " ORDER BY timestamp ASC, address ASC"
+        with self._lock, self._connect() as conn: return [dict(r) for r in conn.execute(sql, args).fetchall()]
+
+    def historical_signals(self, chain: str = "sol", address: str | None = None,
+                           start_ts: int | None = None, end_ts: int | None = None) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM research_signals WHERE chain=?"; args: list[Any] = [chain]
+        if address: sql += " AND address=?"; args.append(address)
+        if start_ts is not None: sql += " AND timestamp>=?"; args.append(int(start_ts))
+        if end_ts is not None: sql += " AND timestamp<=?"; args.append(int(end_ts))
+        sql += " ORDER BY timestamp ASC, address ASC"
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(sql, args).fetchall()
+        return [{**dict(r), "details": json.loads(r["details_json"])} for r in rows]
+
+    def save_backtest(self, config: dict[str, Any], result: dict[str, Any], trades: list[dict[str, Any]],
+                      start_ts: int | None, end_ts: int | None) -> int:
+        now = int(time.time())
+        with self._lock, self._connect() as conn:
+            cur = conn.execute("""INSERT INTO backtest_runs(created_at,strategy_config_json,start_ts,end_ts,
+              priority_score_version,signal_rules_version,risk_rules_version,sample_size,result_json)
+              VALUES(?,?,?,?,?,?,?,?,?)""", (now, json.dumps(config, sort_keys=True), start_ts, end_ts,
+                config.get("priority_score_version", "v1"), config.get("signal_rules_version", "v1"),
+                config.get("risk_rules_version", "v1"), len(trades), json.dumps(result, sort_keys=True)))
+            run_id = int(cur.lastrowid)
+            for trade in trades:
+                conn.execute("""INSERT INTO backtest_trades(run_id,token_address,symbol,signal_type,entry_timestamp,entry_price,entry_market_cap,outcome_json)
+                  VALUES(?,?,?,?,?,?,?,?)""", (run_id, trade.get("token_address", ""), trade.get("symbol"), trade.get("signal_type"),
+                    trade.get("entry_timestamp"), trade.get("entry_price"), trade.get("entry_market_cap"), json.dumps(trade, sort_keys=True)))
+        return run_id
+
+    def backtest_runs(self, limit: int = 50) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as conn: rows = conn.execute("SELECT * FROM backtest_runs ORDER BY created_at DESC LIMIT ?", (max(1, min(limit, 200)),)).fetchall()
+        return [{**dict(r), "strategy_config": json.loads(r["strategy_config_json"]), "result": json.loads(r["result_json"])} for r in rows]
+
+    def backtest_trades(self, run_id: int) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as conn: rows = conn.execute("SELECT * FROM backtest_trades WHERE run_id=? ORDER BY entry_timestamp", (run_id,)).fetchall()
+        return [{**dict(r), "outcome": json.loads(r["outcome_json"])} for r in rows]

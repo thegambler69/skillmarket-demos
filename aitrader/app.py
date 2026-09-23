@@ -30,13 +30,14 @@ from dataclasses import dataclass, field, asdict
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from research_service import GMGNResearchService, deterministic_risk, normalize_trending
 from research_signals import derive_signals
 from research_storage import ResearchStore
 from smart_money_service import SmartMoneyService, SmartMoneyCollector
+from replay_engine import ReplayEngine
 
 random.seed(7)
 HERE = pathlib.Path(__file__).resolve().parent
@@ -224,6 +225,7 @@ def smart_interval():
     return max(10, int(research_setting("smart_money_poll_interval") or 60))
 SMART_MONEY = SmartMoneyService(RESEARCH, RESEARCH_STORE, research_setting)
 SMART_COLLECTOR = SmartMoneyCollector(SMART_MONEY, smart_interval)
+REPLAY_ENGINE = ReplayEngine(RESEARCH_STORE)
 
 # ──────────────────────────────────────────────────────────────────────────
 # 2. GMGN 适配器
@@ -2028,6 +2030,65 @@ def api_research_token_detail(address: str, chain: str = "sol"):
             "lifecycle": RESEARCH_STORE.lifecycle(chain, address),
             "signals": [s for s in RESEARCH_STORE.recent_signals(chain, 300) if s["address"] == address],
             "tracked_wallets": RESEARCH_STORE.tracked_wallets(chain, 500)}
+
+@app.post("/api/research/replay")
+def api_research_replay(config: dict):
+    config = dict(config or {}); config.setdefault("chain", "sol")
+    return REPLAY_ENGINE.replay(config)
+
+@app.post("/api/research/backtest")
+def api_research_backtest(config: dict):
+    config = dict(config or {}); config.setdefault("chain", "sol")
+    result = REPLAY_ENGINE.backtest(config)
+    run_id = RESEARCH_STORE.save_backtest(config, result["result"], result["trades"], config.get("start_ts"), config.get("end_ts"))
+    return {"run_id": run_id, **result}
+
+@app.get("/api/research/backtests")
+def api_research_backtests(limit: int = 50):
+    return {"runs": RESEARCH_STORE.backtest_runs(limit)}
+
+@app.get("/api/research/backtests/{run_id}/trades")
+def api_research_backtest_trades(run_id: int):
+    return {"run_id": run_id, "trades": RESEARCH_STORE.backtest_trades(run_id)}
+
+@app.post("/api/research/signal-performance")
+def api_research_signal_performance(config: dict):
+    config = dict(config or {}); config.setdefault("chain", "sol")
+    return {"rule_versions": {"priority_score": "v1", "signal_rules": "v1", "risk_rules": "v1"}, "signals": REPLAY_ENGINE.signal_performance(config)}
+
+@app.post("/api/research/parameter-explorer")
+def api_research_parameter_explorer(config: dict):
+    base = dict(config or {}); base.setdefault("chain", "sol")
+    grids = {"min_priority_score": [50,60,70,80,90], "min_buy_ratio": [.50,.55,.60,.65,.70], "min_smart_money_count": [1,2,3,5], "max_bundler_pct": [.10,.20,.30], "max_top10_pct": [.20,.30,.40,.50], "min_dev_score": [20,40,60,80]}
+    results=[]
+    # One-factor-at-a-time comparisons avoid silently optimizing combinations.
+    for key, values in grids.items():
+        for value in values:
+            c=dict(base); c[key]=value; bt=REPLAY_ENGINE.backtest(c)
+            results.append({"parameter":key,"value":value,"metrics":bt["result"],"sample_size":len(bt["trades"])})
+    return {"method":"one_factor_at_a_time","results":results}
+
+@app.get("/api/research/backtests/{run_id}/export.csv")
+def api_research_backtest_export(run_id: int):
+    import csv, io
+    trades=RESEARCH_STORE.backtest_trades(run_id); out=io.StringIO(); fields=["token_address","symbol","signal_type","entry_timestamp","entry_price","entry_market_cap","outcome"]
+    w=csv.DictWriter(out,fieldnames=fields); w.writeheader()
+    for t in trades: w.writerow({k:t.get(k) for k in fields})
+    return Response(out.getvalue(),media_type="text/csv",headers={"Content-Disposition":f"attachment; filename=backtest-{run_id}-trades.csv"})
+
+@app.get("/api/research/signal-performance.csv")
+def api_research_signal_export():
+    import csv, io
+    rows=REPLAY_ENGINE.signal_performance({"chain":"sol"}); out=io.StringIO(); fields=["signal_type","sample_count","median_entry_mc","median_5m_return","median_15m_return","median_60m_return","median_max_upside","median_max_drawdown","incomplete"]
+    w=csv.DictWriter(out,fieldnames=fields); w.writeheader(); w.writerows({k:r.get(k) for k in fields} for r in rows)
+    return Response(out.getvalue(),media_type="text/csv",headers={"Content-Disposition":"attachment; filename=signal-performance.csv"})
+
+@app.get("/api/research/strategy-results.csv")
+def api_research_strategy_export():
+    import csv, io
+    rows=RESEARCH_STORE.backtest_runs(200); out=io.StringIO(); fields=["id","created_at","start_ts","end_ts","sample_size","priority_score_version","signal_rules_version","risk_rules_version"]
+    w=csv.DictWriter(out,fieldnames=fields); w.writeheader(); w.writerows({k:r.get(k) for k in fields} for r in rows)
+    return Response(out.getvalue(),media_type="text/csv",headers={"Content-Disposition":"attachment; filename=strategy-results.csv"})
 
 def _sample_activity(g: GMGNAdapter, addr: str, target: int) -> dict:
     """抽样最近 N 笔逐笔交易：翻页累积到 target（或翻页耗尽），最多 4 页防止烧配额。"""
