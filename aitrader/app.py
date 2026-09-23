@@ -1862,6 +1862,8 @@ class WalletIn(BaseModel):
 
 class TokenInspectIn(BaseModel):
     address: str
+    include_holders: bool = False
+    include_traders: bool = False
 
 class SmartSettingsIn(BaseModel):
     smart_money_poll_interval: Optional[int] = None
@@ -2030,7 +2032,7 @@ def api_research_token_inspector(request: TokenInspectIn):
         _rate_limit_http("Token Inspector is temporarily unavailable; no cached token inspection exists.")
     try:
         address = RESEARCH.validate_sol_address(address)
-        result = RESEARCH.inspect_sol(address)
+        result = RESEARCH.inspect_sol(address, request.include_holders, request.include_traders)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     except Exception as exc:

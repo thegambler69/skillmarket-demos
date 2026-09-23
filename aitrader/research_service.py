@@ -14,7 +14,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 from gmgn_guard import SHARED_GMGN_GUARD, RateLimitGuardError
-from gmgn_scheduler import SHARED_GMGN_SCHEDULER
+from gmgn_scheduler import SHARED_GMGN_SCHEDULER, endpoint_weight
 
 
 SOL_ADDRESS = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
@@ -93,7 +93,7 @@ class GMGNResearchService:
         with self._lock:
             cached = self._cache.get(cache_key)
             if cached and cached.expires_at > now:
-                SHARED_GMGN_SCHEDULER.cache_hit()
+                SHARED_GMGN_SCHEDULER.cache_hit(endpoint_weight(["gmgn-cli", *args])[0])
                 return cached.value
             if SHARED_GMGN_GUARD.blocked():
                 self._last_errors[cache_key] = "GMGN_RATE_LIMITED"
@@ -148,14 +148,14 @@ class GMGNResearchService:
         )
         return self._data(result).get("rank") or []
 
-    def inspect_sol(self, address: str) -> dict[str, Any]:
+    def inspect_sol(self, address: str, include_holders: bool = False, include_traders: bool = False) -> dict[str, Any]:
         address = self.validate_sol_address(address)
         prefix = f"token:sol:{address}"
         info = self._data(self._call(["token", "info", "--chain", "sol", "--address", address], prefix + ":info", 30))
         security = self._data(self._call(["token", "security", "--chain", "sol", "--address", address], prefix + ":security", 60))
         pool = self._data(self._call(["token", "pool", "--chain", "sol", "--address", address], prefix + ":pool", 30))
-        holders = self._data(self._call(["token", "holders", "--chain", "sol", "--address", address, "--limit", "20"], prefix + ":holders", 60)).get("list") or []
-        traders = self._data(self._call(["token", "traders", "--chain", "sol", "--address", address, "--limit", "20"], prefix + ":traders", 45)).get("list") or []
+        holders = self._data(self._call(["token", "holders", "--chain", "sol", "--address", address, "--limit", "20"], prefix + ":holders", 180)).get("list") or [] if include_holders else []
+        traders = self._data(self._call(["token", "traders", "--chain", "sol", "--address", address, "--limit", "20"], prefix + ":traders", 120)).get("list") or [] if include_traders else []
         return {"info": info, "security": security, "pool": pool, "holders": holders, "traders": traders}
 
 
