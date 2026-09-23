@@ -37,6 +37,7 @@ class _Job:
 
 class GMGNScheduler:
     def __init__(self) -> None:
+        self.plan_profile = os.getenv("GMGN_PLAN_PROFILE", "FREE").upper()
         self.rps = float(os.getenv("GMGN_REQUESTS_PER_SECOND", "2"))
         self.min_gap = max(0.5, float(os.getenv("GMGN_MIN_REQUEST_GAP_MS", "500")) / 1000.0)
         self.max_queue = max(1, int(os.getenv("GMGN_MAX_QUEUE_SIZE", "128")))
@@ -160,6 +161,7 @@ class GMGNScheduler:
             data["queue_depth"] = len(self._queue)
             data["oldest_queued_seconds"] = max(0.0, time.monotonic() - min((j.queued_at for j in self._queue), default=time.monotonic()))
             data["configured_rps"] = self.rps
+            data["plan_profile"] = self.plan_profile
             data["configured_min_gap_ms"] = int(self.min_gap * 1000)
             data["state"] = "RATE LIMITED" if SHARED_GMGN_GUARD.blocked() else ("DEGRADED" if self._degraded_until > time.monotonic() else "NORMAL")
             data["effective_request_rate"] = 1.0 / max(self.min_gap, 0.001)
