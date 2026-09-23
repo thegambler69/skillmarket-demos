@@ -2109,6 +2109,7 @@ def smart_status() -> dict:
     counts = RESEARCH_STORE.counts()
     cache = RESEARCH_STORE.load_cache("live_market")
     smart_cache = RESEARCH_STORE.load_cache("smart_money_events")
+    shared_limit = _guard_state()
     # Version is local metadata, not a research request. Cache it so repeated
     # health polling (especially during a ban) never spawns gmgn-cli processes.
     if GMGN_CLI_VERSION is None:
@@ -2119,13 +2120,17 @@ def smart_status() -> dict:
     db_counts = {**counts, "backtests": len(RESEARCH_STORE.backtest_runs(200))}
     market_error = MARKET_HEALTH.get("last_error")
     smart_error = SMART_MONEY.last_error
+    market_stale = bool(shared_limit.get("active") or market_error or (cache and cache.get("stale")))
+    smart_stale = bool(shared_limit.get("active") or SMART_MONEY.stale)
+    market_state = "RATE_LIMITED" if shared_limit.get("active") else _state_label(market_stale, market_error, MARKET_COLLECTOR_PAUSED)
+    smart_state = "RATE_LIMITED" if shared_limit.get("active") else _state_label(smart_stale, smart_error)
     return {"gmgn_cli_version": version, "gmgn_auth": "configured" if load_env().get("GMGN_API_KEY") else "missing",
             "gmgn_connection": "error" if SMART_MONEY.last_error else ("connected" if SMART_MONEY.last_success else "starting"),
             "last_successful_update": SMART_MONEY.last_success or (smart_cache or {}).get("updated_at"), "tracked_wallet_count": counts["tracked_wallets"],
             "recent_event_count": counts["smart_money_events"], "database": "ok", "database_path": str(RESEARCH_STORE.path), "database_size": RESEARCH_STORE.db_size(), "counts": db_counts,
-            "market_collector": {"running": bool(MARKET_COLLECTOR_THREAD and MARKET_COLLECTOR_THREAD.is_alive()), "paused": MARKET_COLLECTOR_PAUSED, "started_at": MARKET_COLLECTOR_STARTED, **MARKET_HEALTH, "last_success": MARKET_HEALTH.get("last_success") or (cache or {}).get("updated_at"), "stale": bool(market_error or (cache and cache.get("stale"))), "state": _state_label(bool(market_error or (cache and cache.get("stale"))), market_error, MARKET_COLLECTOR_PAUSED), **_retry_metadata(market_error)},
-            "smart_money_collector": {"running": bool(SMART_COLLECTOR.thread and SMART_COLLECTOR.thread.is_alive()), "started_at": SMART_COLLECTOR.started_at, "last_attempt": SMART_MONEY.last_attempt, "last_success": SMART_MONEY.last_success or (smart_cache or {}).get("updated_at"), "next_attempt": SMART_MONEY.next_attempt, "consecutive_failures": SMART_MONEY.consecutive_failures, "rate_limit_events": SMART_MONEY.rate_limit_events, "last_error": smart_error, "stale": SMART_MONEY.stale, "state": _state_label(SMART_MONEY.stale, smart_error), **_retry_metadata(smart_error)},
-            "shared_rate_limit": _guard_state(), "stale": SMART_MONEY.stale or bool(market_error or (cache and cache.get("stale"))), "error": smart_error or market_error, "settings": api_research_settings()}
+            "market_collector": {"running": bool(MARKET_COLLECTOR_THREAD and MARKET_COLLECTOR_THREAD.is_alive()), "paused": MARKET_COLLECTOR_PAUSED, "started_at": MARKET_COLLECTOR_STARTED, **MARKET_HEALTH, "last_success": MARKET_HEALTH.get("last_success") or (cache or {}).get("updated_at"), "stale": market_stale, "state": market_state, "next_attempt": (shared_limit.get("next_retry") if shared_limit.get("active") else MARKET_HEALTH.get("next_attempt")), **_retry_metadata(market_error)},
+            "smart_money_collector": {"running": bool(SMART_COLLECTOR.thread and SMART_COLLECTOR.thread.is_alive()), "started_at": SMART_COLLECTOR.started_at, "last_attempt": SMART_MONEY.last_attempt, "last_success": SMART_MONEY.last_success or (smart_cache or {}).get("updated_at"), "next_attempt": (shared_limit.get("next_retry") if shared_limit.get("active") else SMART_MONEY.next_attempt), "consecutive_failures": SMART_MONEY.consecutive_failures, "rate_limit_events": SMART_MONEY.rate_limit_events, "last_error": smart_error, "stale": smart_stale, "state": smart_state, **_retry_metadata(smart_error)},
+            "shared_rate_limit": shared_limit, "stale": smart_stale or market_stale, "error": smart_error or market_error, "settings": api_research_settings()}
 
 @app.get("/api/research/quality")
 def api_research_quality():
