@@ -11,6 +11,7 @@ import os
 import subprocess
 import threading
 import time
+from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import Any
@@ -75,6 +76,7 @@ class GMGNScheduler:
         self.weight_budget = float(os.getenv("GMGN_WEIGHT_BUDGET_PER_SEC", "4.0"))
         self.official_plan_weight = float(os.getenv("GMGN_OFFICIAL_PLAN_WEIGHT", "5"))
         self._next_virtual_time = 0.0
+        self._weight_history = deque()
         self._stop = False
         self._thread = threading.Thread(target=self._worker, name="gmgn-scheduler", daemon=True)
         self._thread.start()
@@ -168,6 +170,8 @@ class GMGNScheduler:
                     self.metrics["total_attempted"] += 1
                     self.metrics["last_request_timestamp"] = time.time()
                     self.metrics["total_weight"] += job.weight
+                    now_hist = time.monotonic(); self._weight_history.append((now_hist, job.weight))
+                    while self._weight_history and now_hist - self._weight_history[0][0] > 10: self._weight_history.popleft()
                     if job.unknown_weight: self.metrics["unknown_weight_requests"] += 1
                     self.metrics["by_category"][job.category] = self.metrics["by_category"].get(job.category, 0) + 1
                     ep = self.metrics["by_endpoint"].setdefault(job.endpoint, {"requests": 0, "weight": 0})
@@ -213,6 +217,8 @@ class GMGNScheduler:
             data["configured_min_gap_ms"] = int(self.min_gap * 1000)
             data["state"] = "RATE LIMITED" if SHARED_GMGN_GUARD.blocked() else ("DEGRADED" if self._degraded_until > time.monotonic() else "NORMAL")
             data["effective_weight_rate"] = self.weight_budget
+            now = time.monotonic()
+            data["current_weight_rate"] = sum(w for t, w in self._weight_history if now - t <= 10) / 10.0
             data["max_queue_size"] = self.max_queue
             return data
 
