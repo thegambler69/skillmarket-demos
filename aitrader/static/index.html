@@ -403,6 +403,7 @@ td{padding:5px 10px;vertical-align:middle}
         <button id="tabToken" class="on" onclick="switchView('token')" data-i18n="tab_token">代币筛选</button>
         <button id="tabLive" onclick="switchView('live')">LIVE MARKET</button>
         <button id="tabInspector" onclick="switchView('inspector')">TOKEN INSPECTOR</button>
+        <button id="tabSmart" onclick="switchView('smart')">SMART MONEY</button>
         <button id="tabWallet" onclick="switchView('wallet')" data-i18n="tab_wallet">钱包评估</button>
       </div>
     </div>
@@ -480,6 +481,12 @@ td{padding:5px 10px;vertical-align:middle}
     <div class="research-head"><h2>Token Inspector</h2><input id="inspectAddr" style="min-width:340px;flex:1" placeholder="Solana token contract address" onkeydown="if(event.key==='Enter')inspectToken()"><button class="research-go" onclick="inspectToken()">Inspect</button></div>
     <div class="research-note">Read-only: info, security, pool, holders and traders. Risk output is deterministic thresholds, not an LLM verdict.</div>
     <div id="inspectorResult" class="wlt-empty">Enter a Solana token address to inspect it and view its stored lifecycle.</div>
+  </div></div>
+  <div id="viewSmart" class="view" style="display:none"><div class="research">
+    <div class="research-head"><h2>Smart Money Intelligence</h2><span class="research-note">Read-only GMGN smart-money/KOL activity · deterministic clusters</span><button class="research-go" onclick="collectSmart(true)">Collect now</button></div>
+    <div id="smartStatus" class="lifecycle">Collector starting…</div>
+    <div class="smart-settings"><label>Poll <input id="smPoll" type="number" min="10" value="60">s</label><label>Min score <input id="smScore" type="number" min="0" max="100" value="70"></label><label>Cluster wallets <input id="smCluster" type="number" min="2" value="3"></label><label>Window <input id="smWindow" type="number" min="30" value="1800">s</label><label>Max wallets <input id="smMax" type="number" min="1" value="100"></label><button class="research-go" onclick="saveSmartSettings()">Save settings</button></div>
+    <div id="smartResult" class="wlt-empty">Open this tab to load shared Smart Money activity.</div>
   </div></div>
 </div>
 
@@ -1734,6 +1741,7 @@ function detectAddrChain(a){
   return null;
 }
 let liveMarketTimer=null;
+let smartMoneyTimer=null;
 const rNum=v=>Number(v||0);
 const rPct=v=>(rNum(v)*100).toFixed(1)+'%';
 const rAge=s=>{s=rNum(s);if(s>=86400)return Math.floor(s/86400)+'d';if(s>=3600)return Math.floor(s/3600)+'h';return Math.max(0,Math.floor(s/60))+'m';};
@@ -1747,7 +1755,7 @@ async function loadLiveMarket(manual=false){
     if(!res.ok)throw new Error((await res.json()).detail||'Unable to refresh market');
     const data=await res.json();
     const rows=data.rows||[];
-    const table=rows.map(x=>`<tr class="${x.is_new?'newrow':''}">
+    const table=rows.map(x=>`<tr class="${x.is_new?'newrow':''}" onclick="openTokenDetail('${rEsc(x.address)}')">
       <td>${x.rank}${x.rank_change!=null&&x.rank_change!==0?` <span class="jump">${x.rank_change>0?'▲':'▼'}${Math.abs(x.rank_change)}</span>`:''}</td>
       <td><b>${rEsc(x.symbol)}</b><br><small class="ca">${rEsc(shortCA(x.address))}</small></td><td>${fmtMc(x.market_cap)}</td><td>${fmtMc(x.liquidity)}</td><td>${rAge(x.age_seconds)}</td><td>${fmtMc(x.volume)}</td>
       <td>${rChg(x.change_5m)}</td><td>${rChg(x.change_1h)}</td><td>${x.buys}/${x.sells}<br><small>${rPct(x.buy_ratio)}</small></td><td>${x.smart_money_count}</td><td>${x.kol_count}</td><td>${rPct(x.top10_pct)}</td><td>${rPct(x.bundler_pct)}</td><td>${rPct(x.dev_holding_pct)}</td><td>${x.dev_score}</td><td class="${x.score_change>=15?'jump':''}">${x.priority_score}${x.score_change!=null&&x.score_change!==0?` (${x.score_change>0?'+':''}${x.score_change})`:''}</td><td><span class="vd ${x.decision==='research'?'pass':x.decision==='skip'?'reject':'watch'}">${x.decision.toUpperCase()}</span></td>
@@ -1756,6 +1764,19 @@ async function loadLiveMarket(manual=false){
     box.innerHTML=`<div class="research-table"><table><thead><tr><th>#</th><th>Token</th><th>MC</th><th>Liq</th><th>Age</th><th>Vol 1h</th><th>5m</th><th>1h</th><th>Buys / sells</th><th>SM</th><th>KOL</th><th>Top10</th><th>Bundler</th><th>Dev hold</th><th>Dev score</th><th>Priority</th><th>Decision</th></tr></thead><tbody>${table||'<tr><td colspan="17">No current rows.</td></tr>'}</tbody></table></div><div class="lifecycle"><b>Latest signals</b><p>${signals||'No signals recorded yet.'}</p></div>`;
   }catch(e){if(manual)toast(e.message,'err');else console.warn('Live market refresh:',e.message);}
 }
+async function loadSmartMoney(manual=false){
+  const box=document.getElementById('smartResult'); if(source!=='backend'){box.innerHTML='<div class="wlt-empty">Smart Money needs the local backend and GMGN API configuration.</div>';return;}
+  try{const r=await fetch(API+'/api/research/smart-money?limit=100');if(!r.ok)throw new Error('HTTP '+r.status);const d=await r.json();
+    const st=d.status||{};document.getElementById('smartStatus').innerHTML=`GMGN: ${rEsc(st.gmgn_connection)} · collector: ${st.collector_running?'running':'stopped'} · events: ${st.recent_event_count||0} · wallets: ${st.tracked_wallet_count||0} · last update: ${st.last_successful_update?new Date(st.last_successful_update*1000).toLocaleString():'—'}${st.stale?' · STALE / '+rEsc(st.error||'refresh failed'):''}`;
+    const ev=(d.events||[]).map(x=>`<tr onclick="openTokenDetail('${rEsc(x.token_address)}')"><td>${new Date(x.timestamp*1000).toLocaleString()}</td><td>${rEsc(shortCA(x.wallet))}</td><td>${rEsc(x.wallet_type)}</td><td>${rEsc(x.side)}</td><td><b>${rEsc(x.symbol||'?')}</b><br><small class="ca">${rEsc(shortCA(x.token_address))}</small></td><td>${x.entry_price==null?'—':fmtPrice(x.entry_price)}</td><td>${x.entry_market_cap==null?'—':fmtMc(x.entry_market_cap)}</td><td>${x.trade_amount==null?'—':fmtMc(x.trade_amount)}</td><td>${x.current_price==null?'—':fmtPrice(x.current_price)}</td><td>${x.unrealized_performance==null?'—':rChg(x.unrealized_performance)}</td></tr>`).join('');
+    const cl=(d.clusters||[]).map(x=>`<li><b>${rEsc(x.symbol||x.token_address)}</b> · ${x.wallet_count} wallets · ${x.time_span_seconds}s · ${x.participating_wallets.map(w=>rEsc(shortCA(w))).join(', ')}</li>`).join('')||'<li>No deterministic cluster events yet.</li>';
+    box.innerHTML=`<div class="research-table"><table><thead><tr><th>Time</th><th>Wallet</th><th>Type</th><th>Side</th><th>Token</th><th>Entry price</th><th>Entry MC</th><th>Amount</th><th>Current</th><th>Performance</th></tr></thead><tbody>${ev||'<tr><td colspan="10">No activity stored yet.</td></tr>'}</tbody></table></div><div class="lifecycle"><b>Wallet cluster entries</b><ul class="inspect-list">${cl}</ul></div>`;
+  }catch(e){if(manual)toast(e.message,'err');}
+}
+async function collectSmart(manual=false){try{const r=await fetch(API+'/api/research/smart-money/collect',{method:'POST'});if(!r.ok)throw new Error('HTTP '+r.status);await loadSmartMoney(true);}catch(e){if(manual)toast(e.message,'err');}}
+async function saveSmartSettings(){const body={smart_money_poll_interval:+document.getElementById('smPoll').value,min_wallet_score:+document.getElementById('smScore').value,cluster_min_wallets:+document.getElementById('smCluster').value,cluster_window_seconds:+document.getElementById('smWindow').value,max_tracked_wallets:+document.getElementById('smMax').value};try{const r=await fetch(API+'/api/research/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!r.ok)throw new Error('HTTP '+r.status);toast('Smart Money settings saved','ok');}catch(e){toast(e.message,'err');}}
+async function loadSmartSettings(){try{const d=await (await fetch(API+'/api/research/settings')).json();document.getElementById('smPoll').value=d.smart_money_poll_interval;document.getElementById('smScore').value=d.min_wallet_score;document.getElementById('smCluster').value=d.cluster_min_wallets;document.getElementById('smWindow').value=d.cluster_window_seconds;document.getElementById('smMax').value=d.max_tracked_wallets;}catch(_){} }
+function openTokenDetail(address){const input=document.getElementById('inspectAddr');if(input)input.value=address;switchView('inspector');inspectToken();}
 async function inspectToken(){
   const address=(document.getElementById('inspectAddr').value||'').trim();
   const box=document.getElementById('inspectorResult');if(!address){toast('Enter a Solana token address.','err');return;}
@@ -1769,7 +1790,9 @@ async function inspectToken(){
     const flags=[...(d.risk.red_flags||[]),...(d.risk.warnings||[])].map(x=>`<li>${rEsc(x)}</li>`).join('')||'<li>No configured threshold flags.</li>';
     const holderList=(d.holders||[]).slice(0,10).map(h=>`<li><b>${rEsc(shortCA(h.address))}</b> · ${rPct(h.amount_percentage)} · ${(h.tags||[]).map(rEsc).join(', ')||'untagged'}</li>`).join('')||'<li>No holder rows returned.</li>';
     const traderList=(d.traders||[]).slice(0,10).map(h=>`<li><b>${rEsc(shortCA(h.address))}</b> · buys $${rNum(h.buy_volume_cur).toFixed(0)} · sells $${rNum(h.sell_volume_cur).toFixed(0)}</li>`).join('')||'<li>No trader rows returned.</li>';
-    box.innerHTML=`<div class="riskbox ${d.risk.decision}"><h3>${rEsc(i.symbol||'?')} · ${rEsc(i.name||'')}</h3><p>Price ${fmtPrice(p.price)} · Liquidity ${fmtMc(i.liquidity)} · Holders ${rNum(i.holder_count)} · Creator ${rEsc(shortCA((i.dev||{}).creator_address||''))}</p><p><b>Deterministic decision: ${rEsc(d.risk.decision.toUpperCase())}</b> · ${rEsc(d.risk.method)}</p><ul>${flags}</ul><div class="riskcols">${facts}</div></div><div class="inspect-grid"><div class="riskbox"><h3>Top holders</h3><ul class="inspect-list">${holderList}</ul></div><div class="riskbox"><h3>Active traders</h3><ul class="inspect-list">${traderList}</ul></div></div><div id="lifecycleBox" class="lifecycle">Loading stored lifecycle…</div>`;
+    const sm=(d.smart_money_activity||[]).slice(0,10).map(x=>`<li>${new Date(x.timestamp*1000).toLocaleTimeString()} · ${rEsc(x.wallet_type)} ${rEsc(x.side)} · ${rEsc(x.symbol||'?')} · ${rEsc(shortCA(x.wallet))}</li>`).join('')||'<li>No stored smart-wallet activity.</li>';
+    const clusters=(d.wallet_clusters||[]).slice(0,8).map(x=>`<li>${rEsc(x.symbol||x.token_address)} · ${x.wallet_count} wallets · ${x.time_span_seconds}s</li>`).join('')||'<li>No wallet clusters.</li>';
+    box.innerHTML=`<div class="riskbox ${d.risk.decision}"><h3>${rEsc(i.symbol||'?')} · ${rEsc(i.name||'')}</h3><p>Price ${fmtPrice(p.price)} · Liquidity ${fmtMc(i.liquidity)} · Holders ${rNum(i.holder_count)} · Creator ${rEsc(shortCA((i.dev||{}).creator_address||''))}</p><p><b>Deterministic decision: ${rEsc(d.risk.decision.toUpperCase())}</b> · ${rEsc(d.risk.method)}</p><ul>${flags}</ul><div class="riskcols">${facts}</div></div><div class="inspect-grid"><div class="riskbox"><h3>Top holders</h3><ul class="inspect-list">${holderList}</ul></div><div class="riskbox"><h3>Active traders</h3><ul class="inspect-list">${traderList}</ul></div></div><div class="inspect-grid"><div class="riskbox"><h3>Smart-wallet activity</h3><ul class="inspect-list">${sm}</ul></div><div class="riskbox"><h3>Wallet clusters</h3><ul class="inspect-list">${clusters}</ul></div></div><div id="lifecycleBox" class="lifecycle">Loading stored lifecycle…</div>`;
     loadLifecycle(address);
   }catch(e){box.innerHTML='<div class="wlt-err">'+rEsc(e.message)+'</div>';}
 }
@@ -1779,13 +1802,16 @@ function switchView(v){
   document.getElementById('tabToken').classList.toggle('on',v==='token');
   document.getElementById('tabLive').classList.toggle('on',v==='live');
   document.getElementById('tabInspector').classList.toggle('on',v==='inspector');
+  document.getElementById('tabSmart').classList.toggle('on',v==='smart');
   document.getElementById('tabWallet').classList.toggle('on',v==='wallet');
   document.getElementById('viewToken').style.display=v==='token'?'flex':'none';
   document.getElementById('viewLive').style.display=v==='live'?'block':'none';
   document.getElementById('viewInspector').style.display=v==='inspector'?'block':'none';
+  document.getElementById('viewSmart').style.display=v==='smart'?'block':'none';
   document.getElementById('viewWallet').style.display=v==='wallet'?'block':'none';
   if(v==='live'){loadLiveMarket();if(!liveMarketTimer)liveMarketTimer=setInterval(()=>{if(!document.hidden&&curView==='live')loadLiveMarket();},15000);}
   if(v==='wallet'){const a=document.getElementById('wltAddr');if(a)a.focus();}
+  if(v==='smart'){loadSmartSettings();loadSmartMoney();if(!smartMoneyTimer)smartMoneyTimer=setInterval(()=>{if(!document.hidden&&curView==='smart')loadSmartMoney();},30000);}
 }
 
 async function runWallet(){

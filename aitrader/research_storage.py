@@ -79,6 +79,81 @@ class ResearchStore:
                   state_hash TEXT NOT NULL,
                   UNIQUE(chain, address, state_hash)
                 );
+                CREATE TABLE IF NOT EXISTS smart_money_events (
+                  id INTEGER PRIMARY KEY,
+                  event_key TEXT NOT NULL UNIQUE,
+                  timestamp INTEGER NOT NULL,
+                  chain TEXT NOT NULL,
+                  wallet TEXT NOT NULL,
+                  wallet_type TEXT NOT NULL,
+                  side TEXT NOT NULL,
+                  token_address TEXT NOT NULL,
+                  symbol TEXT,
+                  entry_price REAL,
+                  entry_market_cap REAL,
+                  trade_amount REAL,
+                  current_price REAL,
+                  current_market_cap REAL,
+                  unrealized_performance REAL,
+                  raw_json TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_smart_events_time
+                  ON smart_money_events(chain, timestamp DESC);
+                CREATE INDEX IF NOT EXISTS idx_smart_events_token
+                  ON smart_money_events(chain, token_address, timestamp DESC);
+                CREATE TABLE IF NOT EXISTS tracked_wallets (
+                  wallet_address TEXT PRIMARY KEY,
+                  first_seen INTEGER NOT NULL,
+                  last_seen INTEGER NOT NULL,
+                  classification TEXT,
+                  track_record_score REAL,
+                  copy_tradeability_score REAL,
+                  token_count INTEGER,
+                  trade_count INTEGER,
+                  realized_pnl REAL,
+                  win_rate REAL,
+                  average_entry_market_cap REAL,
+                  median_hold_time REAL,
+                  activity_stats_json TEXT NOT NULL,
+                  dev_flag INTEGER,
+                  dev_score REAL,
+                  last_evaluation_timestamp INTEGER
+                );
+                CREATE TABLE IF NOT EXISTS wallet_clusters (
+                  id INTEGER PRIMARY KEY,
+                  event_key TEXT NOT NULL UNIQUE,
+                  timestamp INTEGER NOT NULL,
+                  chain TEXT NOT NULL,
+                  token_address TEXT NOT NULL,
+                  symbol TEXT,
+                  participating_wallets_json TEXT NOT NULL,
+                  wallet_count INTEGER NOT NULL,
+                  time_span_seconds INTEGER NOT NULL,
+                  wallet_scores_json TEXT NOT NULL,
+                  entry_market_caps_json TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_clusters_token_time
+                  ON wallet_clusters(chain, token_address, timestamp DESC);
+                CREATE TABLE IF NOT EXISTS wallet_evaluations (
+                  wallet_address TEXT PRIMARY KEY,
+                  chain TEXT NOT NULL,
+                  last_evaluated INTEGER NOT NULL,
+                  result_json TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS wallet_search_history (
+                  id INTEGER PRIMARY KEY,
+                  wallet_address TEXT NOT NULL,
+                  chain TEXT NOT NULL,
+                  searched_at INTEGER NOT NULL,
+                  last_evaluated INTEGER,
+                  result_json TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_wallet_history_time
+                  ON wallet_search_history(chain, wallet_address, searched_at DESC);
+                CREATE TABLE IF NOT EXISTS research_settings (
+                  key TEXT PRIMARY KEY,
+                  value_json TEXT NOT NULL
+                );
                 """
             )
             # Small forward-only migration: rank is retained to highlight material
@@ -160,3 +235,123 @@ class ResearchStore:
                 "INSERT OR IGNORE INTO token_security_states(timestamp,chain,address,state_json,state_hash) VALUES(?,?,?,?,?)",
                 (int(time.time()), chain, address, normalized, state_hash),
             )
+
+    def save_smart_money_event(self, event: dict[str, Any]) -> bool:
+        key = str(event.get("event_key") or "")
+        if not key:
+            key = hashlib.sha256(json.dumps(event, sort_keys=True, default=str).encode()).hexdigest()
+        with self._lock, self._connect() as conn:
+            cur = conn.execute("""INSERT OR IGNORE INTO smart_money_events
+              (event_key,timestamp,chain,wallet,wallet_type,side,token_address,symbol,
+               entry_price,entry_market_cap,trade_amount,current_price,current_market_cap,
+               unrealized_performance,raw_json)
+              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+                key, int(event.get("timestamp") or time.time()), event.get("chain", "sol"),
+                event.get("wallet", ""), event.get("wallet_type", "smart_money"), event.get("side", ""),
+                event.get("token_address", ""), event.get("symbol") or "", event.get("entry_price"),
+                event.get("entry_market_cap"), event.get("trade_amount"), event.get("current_price"),
+                event.get("current_market_cap"), event.get("unrealized_performance"),
+                json.dumps(event.get("raw", {}), separators=(",", ":"), default=str)))
+        return cur.rowcount > 0
+
+    def smart_money_events(self, chain: str = "sol", limit: int = 100, token_address: str | None = None) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM smart_money_events WHERE chain=?"; args: list[Any] = [chain]
+        if token_address:
+            sql += " AND token_address=?"; args.append(token_address)
+        sql += " ORDER BY timestamp DESC LIMIT ?"; args.append(max(1, min(int(limit), 500)))
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(sql, args).fetchall()
+        return [dict(row) for row in rows]
+
+    def upsert_tracked_wallet(self, wallet: str, now: int, **fields: Any) -> None:
+        with self._lock, self._connect() as conn:
+            old = conn.execute("SELECT * FROM tracked_wallets WHERE wallet_address=?", (wallet,)).fetchone()
+            first = int(old["first_seen"]) if old else now
+            vals = {
+                "classification": fields.get("classification") or (old["classification"] if old else None),
+                "track_record_score": fields.get("track_record_score", old["track_record_score"] if old else None),
+                "copy_tradeability_score": fields.get("copy_tradeability_score", old["copy_tradeability_score"] if old else None),
+                "token_count": fields.get("token_count", old["token_count"] if old else None),
+                "trade_count": fields.get("trade_count", old["trade_count"] if old else None),
+                "realized_pnl": fields.get("realized_pnl", old["realized_pnl"] if old else None),
+                "win_rate": fields.get("win_rate", old["win_rate"] if old else None),
+                "average_entry_market_cap": fields.get("average_entry_market_cap", old["average_entry_market_cap"] if old else None),
+                "median_hold_time": fields.get("median_hold_time", old["median_hold_time"] if old else None),
+                "activity_stats_json": json.dumps(fields.get("activity_stats", {}), separators=(",", ":")),
+                "dev_flag": fields.get("dev_flag", old["dev_flag"] if old else None),
+                "dev_score": fields.get("dev_score", old["dev_score"] if old else None),
+                "last_evaluation_timestamp": fields.get("last_evaluation_timestamp", old["last_evaluation_timestamp"] if old else None),
+            }
+            conn.execute("""INSERT OR REPLACE INTO tracked_wallets
+              (wallet_address,first_seen,last_seen,classification,track_record_score,copy_tradeability_score,
+               token_count,trade_count,realized_pnl,win_rate,average_entry_market_cap,median_hold_time,
+               activity_stats_json,dev_flag,dev_score,last_evaluation_timestamp)
+              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (wallet, first, now, vals["classification"],
+                vals["track_record_score"], vals["copy_tradeability_score"], vals["token_count"], vals["trade_count"],
+                vals["realized_pnl"], vals["win_rate"], vals["average_entry_market_cap"], vals["median_hold_time"],
+                vals["activity_stats_json"], vals["dev_flag"], vals["dev_score"], vals["last_evaluation_timestamp"]))
+
+    def tracked_wallets(self, chain: str = "sol", limit: int = 100) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute("SELECT * FROM tracked_wallets ORDER BY last_seen DESC LIMIT ?", (max(1, min(limit, 500)),)).fetchall()
+        out = []
+        for row in rows:
+            item = dict(row)
+            item["activity_stats"] = json.loads(item.pop("activity_stats_json") or "{}")
+            out.append(item)
+        return out
+
+    def save_cluster(self, cluster: dict[str, Any]) -> bool:
+        with self._lock, self._connect() as conn:
+            cur = conn.execute("""INSERT OR IGNORE INTO wallet_clusters
+              (event_key,timestamp,chain,token_address,symbol,participating_wallets_json,wallet_count,time_span_seconds,wallet_scores_json,entry_market_caps_json)
+              VALUES (?,?,?,?,?,?,?,?,?,?)""", (cluster["event_key"], int(cluster["timestamp"]), cluster.get("chain", "sol"),
+                cluster["token_address"], cluster.get("symbol") or "", json.dumps(cluster.get("participating_wallets", [])),
+                int(cluster["wallet_count"]), int(cluster.get("time_span_seconds", 0)), json.dumps(cluster.get("wallet_scores", {})),
+                json.dumps(cluster.get("entry_market_caps", {}))))
+        return cur.rowcount > 0
+
+    def wallet_clusters(self, chain: str = "sol", token_address: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM wallet_clusters WHERE chain=?"; args: list[Any] = [chain]
+        if token_address:
+            sql += " AND token_address=?"; args.append(token_address)
+        sql += " ORDER BY timestamp DESC LIMIT ?"; args.append(max(1, min(limit, 500)))
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(sql, args).fetchall()
+        out = []
+        for row in rows:
+            item = dict(row)
+            for key, dest in (("participating_wallets_json", "participating_wallets"), ("wallet_scores_json", "wallet_scores"), ("entry_market_caps_json", "entry_market_caps")):
+                item[dest] = json.loads(item.pop(key) or ("[]" if dest == "participating_wallets" else "{}"))
+            out.append(item)
+        return out
+
+    def save_wallet_evaluation(self, address: str, chain: str, result: dict[str, Any], now: int | None = None) -> None:
+        ts = int(now or time.time()); encoded = json.dumps(result, separators=(",", ":"), default=str)
+        with self._lock, self._connect() as conn:
+            conn.execute("INSERT OR REPLACE INTO wallet_evaluations(wallet_address,chain,last_evaluated,result_json) VALUES(?,?,?,?)", (address, chain, ts, encoded))
+            conn.execute("INSERT INTO wallet_search_history(wallet_address,chain,searched_at,last_evaluated,result_json) VALUES(?,?,?,?,?)", (address, chain, ts, ts, encoded))
+
+    def wallet_evaluation(self, address: str, chain: str = "sol") -> dict[str, Any] | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT * FROM wallet_evaluations WHERE wallet_address=? AND chain=?", (address, chain)).fetchone()
+        if not row: return None
+        return {"last_evaluated": row["last_evaluated"], "result": json.loads(row["result_json"])}
+
+    def wallet_history(self, chain: str = "sol", address: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+        sql = "SELECT wallet_address,chain,searched_at,last_evaluated FROM wallet_search_history WHERE chain=?"; args: list[Any] = [chain]
+        if address: sql += " AND wallet_address=?"; args.append(address)
+        sql += " ORDER BY searched_at DESC LIMIT ?"; args.append(max(1, min(limit, 200)))
+        with self._lock, self._connect() as conn: return [dict(row) for row in conn.execute(sql, args).fetchall()]
+
+    def setting(self, key: str, default: Any = None) -> Any:
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT value_json FROM research_settings WHERE key=?", (key,)).fetchone()
+        return json.loads(row[0]) if row else default
+
+    def set_setting(self, key: str, value: Any) -> None:
+        with self._lock, self._connect() as conn: conn.execute("INSERT OR REPLACE INTO research_settings(key,value_json) VALUES(?,?)", (key, json.dumps(value)))
+
+    def counts(self) -> dict[str, int]:
+        with self._lock, self._connect() as conn:
+            return {name: int(conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]) for name in ("token_snapshots", "research_signals", "smart_money_events", "tracked_wallets", "wallet_clusters")}

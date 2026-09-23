@@ -36,6 +36,7 @@ from pydantic import BaseModel
 from research_service import GMGNResearchService, deterministic_risk, normalize_trending
 from research_signals import derive_signals
 from research_storage import ResearchStore
+from smart_money_service import SmartMoneyService, SmartMoneyCollector
 
 random.seed(7)
 HERE = pathlib.Path(__file__).resolve().parent
@@ -210,6 +211,19 @@ def save_trending_cmds(cmds: dict):
 # trading adapter; credentials stay only in the backend subprocess environment.
 RESEARCH_STORE = ResearchStore(OUT_DIR / "gmgn.db")
 RESEARCH = GMGNResearchService(load_env)
+SMART_SETTINGS_DEFAULTS = {
+    "smart_money_poll_interval": 60,
+    "min_wallet_score": 70,
+    "cluster_min_wallets": 3,
+    "cluster_window_seconds": 1800,
+    "max_tracked_wallets": 100,
+}
+def research_setting(key: str, default=None):
+    return RESEARCH_STORE.setting(key, SMART_SETTINGS_DEFAULTS.get(key, default))
+def smart_interval():
+    return max(10, int(research_setting("smart_money_poll_interval") or 60))
+SMART_MONEY = SmartMoneyService(RESEARCH, RESEARCH_STORE, research_setting)
+SMART_COLLECTOR = SmartMoneyCollector(SMART_MONEY, smart_interval)
 
 # ──────────────────────────────────────────────────────────────────────────
 # 2. GMGN 适配器
@@ -234,11 +248,9 @@ class LiveGMGN(GMGNAdapter):
     def __init__(self, chain="sol"):
         self.chain = chain
         self.env = {**os.environ, **load_env()}
-        # 部分网络环境对 openapi.gmgn.ai 做 TLS 中间人检查（自定义 CA，系统 Keychain 已信任但
-        # Node 内置证书库不认），导致 gmgn-cli 报 "self-signed certificate in certificate chain"。
-        # --use-system-ca 让 Node 改走系统信任链，规避这个误判。
-        if "--use-system-ca" not in self.env.get("NODE_OPTIONS", ""):
-            self.env["NODE_OPTIONS"] = (self.env.get("NODE_OPTIONS", "") + " --use-system-ca").strip()
+        # Keep Node's environment compatible with current gmgn-cli releases.
+        # Node 20 rejects the historical --use-system-ca NODE_OPTIONS flag.
+        self.env["NODE_OPTIONS"] = " ".join(x for x in self.env.get("NODE_OPTIONS", "").split() if x != "--use-system-ca")
         self._wallet_cache: dict[str, str] = {}   # chain -> bound wallet address
 
     @staticmethod
@@ -1787,6 +1799,13 @@ class WalletIn(BaseModel):
 class TokenInspectIn(BaseModel):
     address: str
 
+class SmartSettingsIn(BaseModel):
+    smart_money_poll_interval: Optional[int] = None
+    min_wallet_score: Optional[float] = None
+    cluster_min_wallets: Optional[int] = None
+    cluster_window_seconds: Optional[int] = None
+    max_tracked_wallets: Optional[int] = None
+
 def _block_if_public():
     """公开演示为只读：所有写操作（含触发 CLI / 改配置 / 买卖）一律拒绝。"""
     if PUBLIC_DEMO:
@@ -1940,7 +1959,10 @@ def api_research_token_inspector(request: TokenInspectIn):
                 "symbol": info.get("symbol") or "?", "event_type": "SECURITY_DEGRADATION",
                 "severity": "critical", "details": {"before": previous, "after": state}})
     RESEARCH_STORE.save_security_state("sol", address, state)
-    return {"chain": "sol", "address": address, **result, "risk": risk}
+    return {"chain": "sol", "address": address, **result, "risk": risk,
+            "smart_money_activity": RESEARCH_STORE.smart_money_events("sol", 100, address),
+            "wallet_clusters": RESEARCH_STORE.wallet_clusters("sol", address, 100),
+            "lifecycle": RESEARCH_STORE.lifecycle("sol", address)}
 
 @app.get("/api/research/lifecycle")
 def api_research_lifecycle(address: str, chain: str = "sol"):
@@ -1951,6 +1973,61 @@ def api_research_lifecycle(address: str, chain: str = "sol"):
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     return {"chain": chain, "address": address, **RESEARCH_STORE.lifecycle(chain, address)}
+
+@app.get("/api/research/smart-money")
+def api_research_smart_money(limit: int = 100, token: str | None = None):
+    rows = RESEARCH_STORE.smart_money_events("sol", limit, token)
+    return {"chain": "sol", "events": rows,
+            "clusters": RESEARCH_STORE.wallet_clusters("sol", token, limit),
+            "tracked_wallets": RESEARCH_STORE.tracked_wallets("sol", int(research_setting("max_tracked_wallets") or 100)),
+            "status": smart_status()}
+
+@app.post("/api/research/smart-money/collect")
+def api_research_smart_money_collect():
+    # Explicitly read-only: this calls only track smartmoney/kol commands.
+    return SMART_MONEY.collect_once(force=True)
+
+@app.get("/api/research/settings")
+def api_research_settings():
+    return {k: research_setting(k) for k in SMART_SETTINGS_DEFAULTS}
+
+@app.post("/api/research/settings")
+def api_research_settings_update(settings: SmartSettingsIn):
+    values = settings.model_dump(exclude_none=True) if hasattr(settings, "model_dump") else settings.dict(exclude_none=True)
+    for key, value in values.items():
+        if key == "smart_money_poll_interval": value = max(10, min(int(value), 3600))
+        elif key == "cluster_min_wallets": value = max(2, min(int(value), 20))
+        elif key == "cluster_window_seconds": value = max(30, min(int(value), 86400))
+        elif key == "max_tracked_wallets": value = max(1, min(int(value), 500))
+        elif key == "min_wallet_score": value = max(0, min(float(value), 100))
+        RESEARCH_STORE.set_setting(key, value)
+    return api_research_settings()
+
+@app.get("/api/research/status")
+def api_research_status():
+    return smart_status()
+
+def smart_status() -> dict:
+    counts = RESEARCH_STORE.counts()
+    return {"gmgn_connection": "error" if SMART_MONEY.last_error else ("connected" if SMART_MONEY.last_success else "starting"),
+            "last_successful_update": SMART_MONEY.last_success, "tracked_wallet_count": counts["tracked_wallets"],
+            "recent_event_count": counts["smart_money_events"], "database": "ok", "collector_running": bool(SMART_COLLECTOR.thread and SMART_COLLECTOR.thread.is_alive()),
+            "stale": SMART_MONEY.stale, "error": SMART_MONEY.last_error, "settings": api_research_settings()}
+
+@app.get("/api/research/wallet-history")
+def api_research_wallet_history(address: str | None = None, chain: str = "sol", limit: int = 50):
+    return {"chain": chain, "history": RESEARCH_STORE.wallet_history(chain, address, limit)}
+
+@app.get("/api/research/token-detail")
+def api_research_token_detail(address: str, chain: str = "sol"):
+    try: address = RESEARCH.validate_sol_address(address)
+    except ValueError as exc: raise HTTPException(400, str(exc))
+    return {"chain": chain, "address": address,
+            "events": RESEARCH_STORE.smart_money_events(chain, 100, address),
+            "clusters": RESEARCH_STORE.wallet_clusters(chain, address, 100),
+            "lifecycle": RESEARCH_STORE.lifecycle(chain, address),
+            "signals": [s for s in RESEARCH_STORE.recent_signals(chain, 300) if s["address"] == address],
+            "tracked_wallets": RESEARCH_STORE.tracked_wallets(chain, 500)}
 
 def _sample_activity(g: GMGNAdapter, addr: str, target: int) -> dict:
     """抽样最近 N 笔逐笔交易：翻页累积到 target（或翻页耗尽），最多 4 页防止烧配额。"""
@@ -1974,6 +2051,9 @@ def api_wallet(w: WalletIn):
     addr = (w.address or "").strip()
     if not addr:
         raise HTTPException(400, "缺少钱包地址")
+    cached_wallet = RESEARCH_STORE.wallet_evaluation(addr, ch)
+    if cached_wallet and int(time.time()) - int(cached_wallet["last_evaluated"]) < 300:
+        return JSONResponse(cached_wallet["result"])
     g = ST.adapter_for(ch)
     try:
         raw_stats = g.portfolio_stats(addr)
@@ -2011,10 +2091,20 @@ def api_wallet(w: WalletIn):
             copy = _discount_self_dealing(copy)
         bt = copytrade_backtest(stats, summ, w.latency_s, w.slippage_pct, w.gas_usd)
         verdict = wallet_verdict(stats, track, copy, dev)
-    return JSONResponse(dict(
+    payload = dict(
         chain=ch, address=addr, live=ST.is_live_adapter, no_trades=no_trades,
         stats=stats, activity=summ, tags=tags,
-        track=track, copy=copy, backtest=bt, dev=dev, verdict=verdict))
+        track=track, copy=copy, backtest=bt, dev=dev, verdict=verdict)
+    RESEARCH_STORE.save_wallet_evaluation(addr, ch, payload)
+    RESEARCH_STORE.upsert_tracked_wallet(addr, int(time.time()),
+        classification=", ".join(t.get("name_en") or t.get("name", "") for t in tags if isinstance(t, dict)),
+        track_record_score=track.get("score"), copy_tradeability_score=copy.get("score"),
+        token_count=stats.get("token_num"), trade_count=stats.get("trades"), realized_pnl=stats.get("realized_profit"),
+        win_rate=stats.get("winrate"), average_entry_market_cap=summ.get("median_entry_mcap"),
+        median_hold_time=summ.get("median_hold_s"), activity_stats=summ,
+        dev_flag=1 if dev else 0, dev_score=(dev.get("score") if isinstance(dev, dict) else None),
+        last_evaluation_timestamp=int(time.time()))
+    return JSONResponse(payload)
 
 @app.post("/api/buy")
 def api_buy(b: BuyIn):
@@ -2059,6 +2149,8 @@ def _maybe_start_public_broadcast():
     # 公开演示模式：启动后台守护线程定时刷新真实筛选缓存（仅此线程触发 CLI）。
     if PUBLIC_DEMO:
         threading.Thread(target=_public_broadcast_loop, daemon=True).start()
+    else:
+        SMART_COLLECTOR.start()
 
 if __name__ == "__main__":
     import uvicorn
