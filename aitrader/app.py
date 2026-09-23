@@ -232,6 +232,19 @@ MARKET_COLLECTOR_THREAD = None
 MARKET_COLLECTOR_STARTED = None
 MARKET_COLLECTOR_PAUSED = False
 
+def _retry_metadata(error: str | None) -> dict:
+    text = error or ""
+    match = re.search(r"Rate limit resets at ([^.;]+)", text, re.I)
+    return {"rate_limit_reset": match.group(1).strip() if match else None,
+            "rate_limited": bool("429" in text or "rate_limit" in text.lower() or "rate limit" in text.lower())}
+
+def _state_label(stale: bool, error: str | None, paused: bool = False) -> str:
+    if paused: return "COLLECTOR_PAUSED"
+    if _retry_metadata(error)["rate_limited"]: return "RATE_LIMITED"
+    if stale: return "STALE"
+    if error: return "DISCONNECTED"
+    return "LIVE"
+
 def _market_collector_loop():
     global MARKET_COLLECTOR_STARTED
     MARKET_COLLECTOR_STARTED = int(time.time()); delay = 30
@@ -1958,17 +1971,17 @@ def api_research_live_market(limit: int = 50):
             if "429" in upstream_error or "rate limit" in upstream_error.lower(): MARKET_HEALTH["rate_limit_events"] += 1
             cached = RESEARCH_STORE.load_cache("live_market")
             last_success = (cached or {}).get("updated_at")
-            return {"chain":"sol", "timestamp":now, "rows":rows, "signals":RESEARCH_STORE.recent_signals("sol",100), "stale":True, "last_success_timestamp":last_success, "error":upstream_error}
+            return {"chain":"sol", "timestamp":now, "rows":rows, "signals":RESEARCH_STORE.recent_signals("sol",100), "stale":True, "last_success_timestamp":last_success, "error":upstream_error, "state":_state_label(True, upstream_error), "next_retry_timestamp":MARKET_HEALTH.get("next_attempt"), **_retry_metadata(upstream_error)}
         MARKET_HEALTH.update(last_success=now, consecutive_failures=0, last_error=None)
         RESEARCH_STORE.save_cache("live_market", rows, now, False, None)
         return {"chain": "sol", "timestamp": now, "rows": rows,
-                "signals": RESEARCH_STORE.recent_signals("sol", 100), "stale": False, "last_success_timestamp": now}
+                "signals": RESEARCH_STORE.recent_signals("sol", 100), "stale": False, "last_success_timestamp": now, "state":"LIVE", "next_retry_timestamp":MARKET_HEALTH.get("next_attempt"), "rate_limited":False, "rate_limit_reset":None}
     except Exception as exc:
         message = str(exc); MARKET_HEALTH["consecutive_failures"] += 1; MARKET_HEALTH["failed_calls"] += 1; MARKET_HEALTH["last_error"] = message
         if "429" in message or "rate limit" in message.lower(): MARKET_HEALTH["rate_limit_events"] += 1
         cached = RESEARCH_STORE.load_cache("live_market")
         if cached:
-            return {"chain":"sol", "timestamp":int(time.time()), "rows":cached["payload"], "signals":RESEARCH_STORE.recent_signals("sol",100), "stale":True, "last_success_timestamp":cached["updated_at"], "error":message}
+            return {"chain":"sol", "timestamp":int(time.time()), "rows":cached["payload"], "signals":RESEARCH_STORE.recent_signals("sol",100), "stale":True, "last_success_timestamp":cached["updated_at"], "error":message, "state":_state_label(True, message), "next_retry_timestamp":MARKET_HEALTH.get("next_attempt"), **_retry_metadata(message)}
         raise HTTPException(502, f"Live market refresh failed: {message}")
 
 @app.post("/api/research/token-inspector")
@@ -2054,13 +2067,15 @@ def smart_status() -> dict:
         version = subprocess.run(["gmgn-cli", "--version"], capture_output=True, text=True, timeout=5, check=False).stdout.strip() or "unknown"
     except Exception: version = "unavailable"
     db_counts = {**counts, "backtests": len(RESEARCH_STORE.backtest_runs(200))}
+    market_error = MARKET_HEALTH.get("last_error")
+    smart_error = SMART_MONEY.last_error
     return {"gmgn_cli_version": version, "gmgn_auth": "configured" if load_env().get("GMGN_API_KEY") else "missing",
             "gmgn_connection": "error" if SMART_MONEY.last_error else ("connected" if SMART_MONEY.last_success else "starting"),
             "last_successful_update": SMART_MONEY.last_success or (smart_cache or {}).get("updated_at"), "tracked_wallet_count": counts["tracked_wallets"],
             "recent_event_count": counts["smart_money_events"], "database": "ok", "database_path": str(RESEARCH_STORE.path), "database_size": RESEARCH_STORE.db_size(), "counts": db_counts,
-            "market_collector": {"running": bool(MARKET_COLLECTOR_THREAD and MARKET_COLLECTOR_THREAD.is_alive()), "paused": MARKET_COLLECTOR_PAUSED, "started_at": MARKET_COLLECTOR_STARTED, **MARKET_HEALTH, "last_success": MARKET_HEALTH.get("last_success") or (cache or {}).get("updated_at"), "stale": bool(MARKET_HEALTH.get("last_error") or (cache and cache.get("stale")))},
-            "smart_money_collector": {"running": bool(SMART_COLLECTOR.thread and SMART_COLLECTOR.thread.is_alive()), "started_at": SMART_COLLECTOR.started_at, "last_attempt": SMART_MONEY.last_attempt, "last_success": SMART_MONEY.last_success or (smart_cache or {}).get("updated_at"), "next_attempt": SMART_MONEY.next_attempt, "consecutive_failures": SMART_MONEY.consecutive_failures, "rate_limit_events": SMART_MONEY.rate_limit_events, "last_error": SMART_MONEY.last_error, "stale": SMART_MONEY.stale},
-            "stale": SMART_MONEY.stale or bool(MARKET_HEALTH.get("last_error") or (cache and cache.get("stale"))), "error": SMART_MONEY.last_error or MARKET_HEALTH.get("last_error"), "settings": api_research_settings()}
+            "market_collector": {"running": bool(MARKET_COLLECTOR_THREAD and MARKET_COLLECTOR_THREAD.is_alive()), "paused": MARKET_COLLECTOR_PAUSED, "started_at": MARKET_COLLECTOR_STARTED, **MARKET_HEALTH, "last_success": MARKET_HEALTH.get("last_success") or (cache or {}).get("updated_at"), "stale": bool(market_error or (cache and cache.get("stale"))), "state": _state_label(bool(market_error or (cache and cache.get("stale"))), market_error, MARKET_COLLECTOR_PAUSED), **_retry_metadata(market_error)},
+            "smart_money_collector": {"running": bool(SMART_COLLECTOR.thread and SMART_COLLECTOR.thread.is_alive()), "started_at": SMART_COLLECTOR.started_at, "last_attempt": SMART_MONEY.last_attempt, "last_success": SMART_MONEY.last_success or (smart_cache or {}).get("updated_at"), "next_attempt": SMART_MONEY.next_attempt, "consecutive_failures": SMART_MONEY.consecutive_failures, "rate_limit_events": SMART_MONEY.rate_limit_events, "last_error": smart_error, "stale": SMART_MONEY.stale, "state": _state_label(SMART_MONEY.stale, smart_error), **_retry_metadata(smart_error)},
+            "stale": SMART_MONEY.stale or bool(market_error or (cache and cache.get("stale"))), "error": smart_error or market_error, "settings": api_research_settings()}
 
 @app.get("/api/research/quality")
 def api_research_quality():
