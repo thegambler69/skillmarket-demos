@@ -33,6 +33,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from research_service import GMGNResearchService, deterministic_risk, normalize_trending
+from research_signals import derive_signals
+from research_storage import ResearchStore
 
 random.seed(7)
 HERE = pathlib.Path(__file__).resolve().parent
@@ -121,7 +124,7 @@ def native_decimals(chain): return NATIVE_DECIMALS.get(chain, 9)
 # 已解锁(False)：LIVE 模式 + 已配 GMGN_PRIVATE_KEY 时，「一键买入/平仓」会真实发单、动用资金、不可逆。
 # 仍是人在环：只有用户点按钮才成交；SHADOW 是默认安全态，需手动切 LIVE 才真发。
 # ⚠️ 真实下单要求 ~/.config/gmgn/.env 里 GMGN_PRIVATE_KEY 非空（签名密钥），否则 gmgn-cli 报错。
-LIVE_TRADING_DISABLED = False
+LIVE_TRADING_DISABLED = True
 
 # 公开演示（只读广播）：设环境变量 PUBLIC_DEMO=1 开启。用于把看板挂公网给不特定访客看
 # 真实筛选数据，同时把后端收敛成纯只读：
@@ -202,6 +205,11 @@ def save_trending_cmds(cmds: dict):
         TRENDING_CMDS_PATH.write_text(json.dumps(cmds, ensure_ascii=False))
     except Exception:
         pass
+
+# Phase 1 browser-research services. They are read-only and separate from the
+# trading adapter; credentials stay only in the backend subprocess environment.
+RESEARCH_STORE = ResearchStore(OUT_DIR / "gmgn.db")
+RESEARCH = GMGNResearchService(load_env)
 
 # ──────────────────────────────────────────────────────────────────────────
 # 2. GMGN 适配器
@@ -1776,6 +1784,9 @@ class WalletIn(BaseModel):
     gas_usd: float = 0.2         # 每笔 gas
     sample: int = 200            # 逐笔 activity 抽样上限（最近 N 笔）
 
+class TokenInspectIn(BaseModel):
+    address: str
+
 def _block_if_public():
     """公开演示为只读：所有写操作（含触发 CLI / 改配置 / 买卖）一律拒绝。"""
     if PUBLIC_DEMO:
@@ -1880,6 +1891,66 @@ def api_run(r: RunIn):
             return JSONResponse(screen_once(ch))
         except Exception as e:
             raise HTTPException(502, f"扫描失败：{e}")
+
+@app.get("/api/research/live-market")
+def api_research_live_market(limit: int = 50):
+    """Shared cached Solana feed. This endpoint never invokes trading code."""
+    try:
+        now = int(time.time())
+        raw_rows = RESEARCH.trending_sol(max(5, min(limit, 100)))
+        rows = []
+        for raw in raw_rows:
+            row = normalize_trending(raw, now)
+            if not row["address"]:
+                continue
+            previous = RESEARCH_STORE.latest_snapshot("sol", row["address"])
+            signals = derive_signals(row, previous)
+            RESEARCH_STORE.save_snapshot(row)
+            for signal in signals:
+                RESEARCH_STORE.save_signal(signal)
+            row["is_new"] = previous is None
+            row["rank_change"] = previous.get("rank", 0) - row["rank"] if previous and previous.get("rank") is not None else None
+            row["score_change"] = row["priority_score"] - previous["priority_score"] if previous else None
+            rows.append(row)
+        return {"chain": "sol", "timestamp": now, "rows": rows,
+                "signals": RESEARCH_STORE.recent_signals("sol", 100), "stale": False}
+    except Exception as exc:
+        raise HTTPException(502, f"Live market refresh failed: {exc}")
+
+@app.post("/api/research/token-inspector")
+def api_research_token_inspector(request: TokenInspectIn):
+    try:
+        address = RESEARCH.validate_sol_address(request.address)
+        result = RESEARCH.inspect_sol(address)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except Exception as exc:
+        raise HTTPException(502, f"Token inspection failed: {exc}")
+    info, security = result["info"], result["security"]
+    risk = deterministic_risk(info, security)
+    previous = RESEARCH_STORE.security_state("sol", address)
+    state = risk["factors"]
+    if previous:
+        degraded = ((previous.get("mint_renounced") and not state["mint_renounced"])
+                    or (previous.get("freeze_renounced") and not state["freeze_renounced"])
+                    or state["rug_ratio"] > previous.get("rug_ratio", 0) + 0.2
+                    or (not previous.get("wash_trading") and state["wash_trading"]))
+        if degraded:
+            RESEARCH_STORE.save_signal({"timestamp": int(time.time()), "chain": "sol", "address": address,
+                "symbol": info.get("symbol") or "?", "event_type": "SECURITY_DEGRADATION",
+                "severity": "critical", "details": {"before": previous, "after": state}})
+    RESEARCH_STORE.save_security_state("sol", address, state)
+    return {"chain": "sol", "address": address, **result, "risk": risk}
+
+@app.get("/api/research/lifecycle")
+def api_research_lifecycle(address: str, chain: str = "sol"):
+    if chain != "sol":
+        raise HTTPException(400, "Phase 1 lifecycle research supports Solana only.")
+    try:
+        address = RESEARCH.validate_sol_address(address)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"chain": chain, "address": address, **RESEARCH_STORE.lifecycle(chain, address)}
 
 def _sample_activity(g: GMGNAdapter, addr: str, target: int) -> dict:
     """抽样最近 N 笔逐笔交易：翻页累积到 target（或翻页耗尽），最多 4 页防止烧配额。"""

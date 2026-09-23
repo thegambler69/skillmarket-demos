@@ -77,7 +77,7 @@ Open http://127.0.0.1:8000 in your browser.
 ## LIVE / SHADOW (important)
 - **SHADOW (paper trading) = the default safe state**: buy/sell only writes to the log + positions.json, and **sends no on-chain transactions**.
 - **LIVE = real trades, real funds, irreversible**: requires ① clicking the **MODE icon top-right to switch to LIVE** (with a second confirmation) + ② `GMGN_PRIVATE_KEY` configured in `~/.config/gmgn/.env` (an Ed25519 PEM signing key, not a wallet private key).
-- `LIVE_TRADING_DISABLED` at the top of `app.py`: **currently `False` (unlocked)**. Set it back to `True` to instantly seal off all on-chain writes (even if switched to LIVE it forces SHADOW and never calls `swap()`).
+- `LIVE_TRADING_DISABLED` at the top of `app.py`: **currently `True` (locked)**. The app forces SHADOW and never calls `swap()`, even if the UI requests LIVE.
 - It's still **human-in-the-loop**: a trade happens only when you click "one-click buy/sell"; after a backend restart the mode reverts to SHADOW (LIVE is not persisted) and must be switched again.
 - A buy **polls to confirm the real fill**: on failure it records no position and does not lie; the fill prompt includes the tx hash — checking it on a block explorer yourself is the most reliable.
 - ⚠️ Real trading is **currently only fully verified on Solana**; for EVM see "Known limitations" below.

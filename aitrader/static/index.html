@@ -292,6 +292,8 @@ td{padding:5px 10px;vertical-align:middle}
 .view{flex:1;min-height:0}
 #viewToken{display:flex;flex-direction:column;gap:9px}
 #viewWallet{display:block;overflow-y:auto;overflow-x:hidden}
+#viewLive,#viewInspector{display:block;overflow-y:auto;overflow-x:hidden}
+.research{max-width:1500px;margin:0 auto;padding:4px 0 24px}.research-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px}.research-head h2{font-family:var(--disp);font-size:22px}.research-note{font-size:11px;color:var(--dim);margin-right:auto}.research-go{font-family:var(--mono);font-weight:700;border:0;border-radius:8px;padding:9px 12px;background:var(--lime);color:var(--ink);cursor:pointer}.research-table{overflow:auto;border:1px solid var(--line);border-radius:12px;background:var(--panel)}.research-table table{min-width:1300px}.research-table th{position:sticky;top:0;background:var(--ink2);z-index:1}.research-table td{white-space:nowrap}.newrow{background:#c8f24a0c}.jump{color:var(--lime);font-weight:700}.riskbox{border:1px solid var(--line);border-radius:12px;background:var(--panel);padding:18px;margin:14px 0}.riskbox.skip{border-color:var(--clay)}.riskbox.watch{border-color:var(--amber)}.riskcols{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-top:12px}.riskfact{padding:10px;background:var(--ink2);border:1px solid var(--line);border-radius:8px;font-size:11px}.inspect-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.inspect-list{max-height:350px;overflow:auto}.inspect-list li{font-size:11px;border-bottom:1px solid var(--line);padding:7px 0;list-style:none}.lifecycle{margin-top:14px;max-height:260px;overflow:auto}.sigpill{font-size:10px;border:1px solid var(--line);border-radius:6px;padding:3px 6px;color:var(--dim)}
 
 /* ═══ 钱包评估视图 ═══ */
 .wlt{max-width:1180px;margin:0 auto;display:flex;flex-direction:column;gap:32px;padding-bottom:24px}
@@ -399,6 +401,8 @@ td{padding:5px 10px;vertical-align:middle}
       <div class="bar-title"><h1>AI&nbsp;TRADER<i>//</i><span data-i18n="h1_suffix">筛选 + 一键成交</span></h1><div class="tag" data-i18n="tag">确定性规则抓全 · ML 砍狠 · LLM 只解释幸存者 · 你按下成交</div></div>
       <div class="viewtabs">
         <button id="tabToken" class="on" onclick="switchView('token')" data-i18n="tab_token">代币筛选</button>
+        <button id="tabLive" onclick="switchView('live')">LIVE MARKET</button>
+        <button id="tabInspector" onclick="switchView('inspector')">TOKEN INSPECTOR</button>
         <button id="tabWallet" onclick="switchView('wallet')" data-i18n="tab_wallet">钱包评估</button>
       </div>
     </div>
@@ -468,6 +472,15 @@ td{padding:5px 10px;vertical-align:middle}
       <div id="wltResult"><div class="wlt-empty" data-i18n="wlt_empty">输入一个钱包地址 → 交易风格标签 · 真实战绩分 · 可跟单分 · 跟单回测 · Dev 信誉</div></div>
     </div>
   </div>
+  <div id="viewLive" class="view" style="display:none"><div class="research">
+    <div class="research-head"><h2>Solana Live Market</h2><span class="research-note">Read-only GMGN feed · deterministic priority and signals · 15s refresh</span><button class="research-go" onclick="loadLiveMarket(true)">Refresh</button></div>
+    <div id="liveMarketResult" class="wlt-empty">Open this tab to load the shared Solana market feed.</div>
+  </div></div>
+  <div id="viewInspector" class="view" style="display:none"><div class="research">
+    <div class="research-head"><h2>Token Inspector</h2><input id="inspectAddr" style="min-width:340px;flex:1" placeholder="Solana token contract address" onkeydown="if(event.key==='Enter')inspectToken()"><button class="research-go" onclick="inspectToken()">Inspect</button></div>
+    <div class="research-note">Read-only: info, security, pool, holders and traders. Risk output is deterministic thresholds, not an LLM verdict.</div>
+    <div id="inspectorResult" class="wlt-empty">Enter a Solana token address to inspect it and view its stored lifecycle.</div>
+  </div></div>
 </div>
 
 <!-- config modal -->
@@ -1720,12 +1733,58 @@ function detectAddrChain(a){
   if(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(a))return 'sol';
   return null;
 }
+let liveMarketTimer=null;
+const rNum=v=>Number(v||0);
+const rPct=v=>(rNum(v)*100).toFixed(1)+'%';
+const rAge=s=>{s=rNum(s);if(s>=86400)return Math.floor(s/86400)+'d';if(s>=3600)return Math.floor(s/3600)+'h';return Math.max(0,Math.floor(s/60))+'m';};
+const rChg=v=>{const n=rNum(v);return `<span class="${n>0?'jump':''}">${n>=0?'+':''}${n.toFixed(1)}%</span>`;};
+const rEsc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+async function loadLiveMarket(manual=false){
+  const box=document.getElementById('liveMarketResult');
+  if(source!=='backend'){box.innerHTML='<div class="wlt-empty">Live Market needs the local backend and GMGN API configuration.</div>';return;}
+  try{
+    const res=await fetch(API+'/api/research/live-market?limit=50');
+    if(!res.ok)throw new Error((await res.json()).detail||'Unable to refresh market');
+    const data=await res.json();
+    const rows=data.rows||[];
+    const table=rows.map(x=>`<tr class="${x.is_new?'newrow':''}">
+      <td>${x.rank}${x.rank_change!=null&&x.rank_change!==0?` <span class="jump">${x.rank_change>0?'▲':'▼'}${Math.abs(x.rank_change)}</span>`:''}</td>
+      <td><b>${rEsc(x.symbol)}</b><br><small class="ca">${rEsc(shortCA(x.address))}</small></td><td>${fmtMc(x.market_cap)}</td><td>${fmtMc(x.liquidity)}</td><td>${rAge(x.age_seconds)}</td><td>${fmtMc(x.volume)}</td>
+      <td>${rChg(x.change_5m)}</td><td>${rChg(x.change_1h)}</td><td>${x.buys}/${x.sells}<br><small>${rPct(x.buy_ratio)}</small></td><td>${x.smart_money_count}</td><td>${x.kol_count}</td><td>${rPct(x.top10_pct)}</td><td>${rPct(x.bundler_pct)}</td><td>${rPct(x.dev_holding_pct)}</td><td>${x.dev_score}</td><td class="${x.score_change>=15?'jump':''}">${x.priority_score}${x.score_change!=null&&x.score_change!==0?` (${x.score_change>0?'+':''}${x.score_change})`:''}</td><td><span class="vd ${x.decision==='research'?'pass':x.decision==='skip'?'reject':'watch'}">${x.decision.toUpperCase()}</span></td>
+    </tr>`).join('');
+    const signals=(data.signals||[]).slice(0,12).map(s=>`<span class="sigpill">${rEsc(s.event_type)} · ${rEsc(s.symbol)}</span>`).join(' ');
+    box.innerHTML=`<div class="research-table"><table><thead><tr><th>#</th><th>Token</th><th>MC</th><th>Liq</th><th>Age</th><th>Vol 1h</th><th>5m</th><th>1h</th><th>Buys / sells</th><th>SM</th><th>KOL</th><th>Top10</th><th>Bundler</th><th>Dev hold</th><th>Dev score</th><th>Priority</th><th>Decision</th></tr></thead><tbody>${table||'<tr><td colspan="17">No current rows.</td></tr>'}</tbody></table></div><div class="lifecycle"><b>Latest signals</b><p>${signals||'No signals recorded yet.'}</p></div>`;
+  }catch(e){if(manual)toast(e.message,'err');else console.warn('Live market refresh:',e.message);}
+}
+async function inspectToken(){
+  const address=(document.getElementById('inspectAddr').value||'').trim();
+  const box=document.getElementById('inspectorResult');if(!address){toast('Enter a Solana token address.','err');return;}
+  if(source!=='backend'){box.innerHTML='<div class="wlt-empty">Token Inspector needs the local backend and GMGN API configuration.</div>';return;}
+  box.innerHTML='<div class="wlt-empty"><span class="spin"></span>Fetching read-only token data…</div>';
+  try{
+    const res=await fetch(API+'/api/research/token-inspector',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address})});
+    if(!res.ok)throw new Error((await res.json()).detail||'Inspection failed');
+    const d=await res.json(), i=d.info||{}, p=i.price||{}, f=d.risk.factors||{};
+    const facts=Object.entries(f).map(([k,v])=>`<div class="riskfact"><small>${rEsc(k.replaceAll('_',' '))}</small><br><b>${typeof v==='number'?(k.includes('pct')?(v*100).toFixed(2)+'%':v.toFixed(3)):rEsc(v)}</b></div>`).join('');
+    const flags=[...(d.risk.red_flags||[]),...(d.risk.warnings||[])].map(x=>`<li>${rEsc(x)}</li>`).join('')||'<li>No configured threshold flags.</li>';
+    const holderList=(d.holders||[]).slice(0,10).map(h=>`<li><b>${rEsc(shortCA(h.address))}</b> · ${rPct(h.amount_percentage)} · ${(h.tags||[]).map(rEsc).join(', ')||'untagged'}</li>`).join('')||'<li>No holder rows returned.</li>';
+    const traderList=(d.traders||[]).slice(0,10).map(h=>`<li><b>${rEsc(shortCA(h.address))}</b> · buys $${rNum(h.buy_volume_cur).toFixed(0)} · sells $${rNum(h.sell_volume_cur).toFixed(0)}</li>`).join('')||'<li>No trader rows returned.</li>';
+    box.innerHTML=`<div class="riskbox ${d.risk.decision}"><h3>${rEsc(i.symbol||'?')} · ${rEsc(i.name||'')}</h3><p>Price ${fmtPrice(p.price)} · Liquidity ${fmtMc(i.liquidity)} · Holders ${rNum(i.holder_count)} · Creator ${rEsc(shortCA((i.dev||{}).creator_address||''))}</p><p><b>Deterministic decision: ${rEsc(d.risk.decision.toUpperCase())}</b> · ${rEsc(d.risk.method)}</p><ul>${flags}</ul><div class="riskcols">${facts}</div></div><div class="inspect-grid"><div class="riskbox"><h3>Top holders</h3><ul class="inspect-list">${holderList}</ul></div><div class="riskbox"><h3>Active traders</h3><ul class="inspect-list">${traderList}</ul></div></div><div id="lifecycleBox" class="lifecycle">Loading stored lifecycle…</div>`;
+    loadLifecycle(address);
+  }catch(e){box.innerHTML='<div class="wlt-err">'+rEsc(e.message)+'</div>';}
+}
+async function loadLifecycle(address){try{const r=await fetch(API+'/api/research/lifecycle?chain=sol&address='+encodeURIComponent(address));if(!r.ok)throw 0;const d=await r.json();const s=(d.snapshots||[]).slice(-20).reverse().map(x=>`<li>${new Date(x.timestamp*1000).toLocaleTimeString()} · ${rEsc(x.symbol)} · ${fmtMc(x.market_cap)} · priority ${x.priority_score}</li>`).join('')||'<li>No snapshots yet; this token will appear after it is observed on the live feed.</li>';const sig=(d.signals||[]).slice(-20).reverse().map(x=>`<li>${rEsc(x.event_type)} · ${new Date(x.timestamp*1000).toLocaleTimeString()}</li>`).join('')||'<li>No stored signals.</li>';document.getElementById('lifecycleBox').innerHTML=`<div class="inspect-grid"><div><h3>Stored snapshots</h3><ul class="inspect-list">${s}</ul></div><div><h3>Lifecycle signals</h3><ul class="inspect-list">${sig}</ul></div></div>`;}catch(_){const e=document.getElementById('lifecycleBox');if(e)e.textContent='Lifecycle data is temporarily unavailable.';}}
 function switchView(v){
   curView=v; sessionStorage.setItem('aitrader_view',v);
   document.getElementById('tabToken').classList.toggle('on',v==='token');
+  document.getElementById('tabLive').classList.toggle('on',v==='live');
+  document.getElementById('tabInspector').classList.toggle('on',v==='inspector');
   document.getElementById('tabWallet').classList.toggle('on',v==='wallet');
   document.getElementById('viewToken').style.display=v==='token'?'flex':'none';
+  document.getElementById('viewLive').style.display=v==='live'?'block':'none';
+  document.getElementById('viewInspector').style.display=v==='inspector'?'block':'none';
   document.getElementById('viewWallet').style.display=v==='wallet'?'block':'none';
+  if(v==='live'){loadLiveMarket();if(!liveMarketTimer)liveMarketTimer=setInterval(()=>{if(!document.hidden&&curView==='live')loadLiveMarket();},15000);}
   if(v==='wallet'){const a=document.getElementById('wltAddr');if(a)a.focus();}
 }
 
