@@ -16,6 +16,10 @@ class SmartMoneyService:
         self._lock = threading.RLock()
         self._cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
         self.last_success: int | None = None
+        self.last_attempt: int | None = None
+        self.next_attempt: int | None = None
+        self.consecutive_failures = 0
+        self.rate_limit_events = 0
         self.last_error: str | None = None
         self.stale = False
 
@@ -73,6 +77,7 @@ class SmartMoneyService:
 
     def collect_once(self, force: bool = False) -> dict[str, Any]:
         with self._lock:
+            self.last_attempt = int(time.time())
             try:
                 if force: self._cache.clear()
                 try:
@@ -81,10 +86,13 @@ class SmartMoneyService:
                     trend = []
                 market = {str(x.get("address")): x for x in trend if x.get("address")}
                 normalized: list[dict[str, Any]] = []
+                upstream_errors: list[str] = []
                 for kind, label in (("smartmoney", "smart_money"), ("kol", "kol")):
                     for row in self._call(kind):
                         event = self.normalize(row, label, market)
                         if event: normalized.append(event)
+                    err = self.research.last_error(f"track:sol:{kind}") if hasattr(self.research, "last_error") else None
+                    if err: upstream_errors.append(err)
                 for event in normalized:
                     self.store.save_smart_money_event(event)
                     self.store.upsert_tracked_wallet(event["wallet"], event["timestamp"], classification=event["wallet_type"])
@@ -107,11 +115,19 @@ class SmartMoneyService:
                         x = rows[-1]; self.store.save_signal({"timestamp": x["timestamp"], "chain": "sol", "address": token, "symbol": x.get("symbol") or "?", "event_type": "SMART_MONEY_ACCELERATION", "severity": "positive", "details": {"buy_events": buys}})
                     if sells >= 2 and sells >= buys:
                         x = rows[-1]; self.store.save_signal({"timestamp": x["timestamp"], "chain": "sol", "address": token, "symbol": x.get("symbol") or "?", "event_type": "SMART_MONEY_DISTRIBUTION", "severity": "warning", "details": {"sell_events": sells, "buy_events": buys}})
+                if upstream_errors:
+                    self.last_error = "; ".join(upstream_errors); self.stale = True; self.consecutive_failures += 1
+                    if any("429" in x or "rate limit" in x.lower() for x in upstream_errors): self.rate_limit_events += 1
+                    return {"events": len(normalized), "clusters": len(clusters), "stale": True, "error": self.last_error, "last_success_timestamp": self.last_success}
                 self.last_success = int(time.time()); self.last_error = None; self.stale = False
+                self.consecutive_failures = 0
+                self.store.save_cache("smart_money_events", normalized, self.last_success, False, None)
                 return {"events": len(normalized), "clusters": len(clusters), "stale": False}
             except Exception as exc:
-                self.last_error = str(exc); self.stale = True
-                return {"events": len(self.store.smart_money_events(limit=100)), "clusters": 0, "stale": True, "error": self.last_error}
+                self.last_error = str(exc); self.stale = True; self.consecutive_failures += 1
+                if "429" in self.last_error or "rate limit" in self.last_error.lower(): self.rate_limit_events += 1
+                cached = self.store.load_cache("smart_money_events")
+                return {"events": len((cached or {}).get("payload", [])) or len(self.store.smart_money_events(limit=100)), "clusters": 0, "stale": True, "error": self.last_error, "last_success_timestamp": (cached or {}).get("updated_at")}
 
     def _clusters(self, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         minimum = int(self.settings_getter("cluster_min_wallets", 3) or 3)
@@ -138,13 +154,16 @@ class SmartMoneyService:
 
 class SmartMoneyCollector:
     def __init__(self, service, interval_getter):
-        self.service = service; self.interval_getter = interval_getter; self.stop = threading.Event(); self.thread = None
+        self.service = service; self.interval_getter = interval_getter; self.stop = threading.Event(); self.thread = None; self.started_at = None; self.base_interval = 60
 
     def start(self):
         if self.thread and self.thread.is_alive(): return
         self.thread = threading.Thread(target=self._run, name="gmgn-smart-money", daemon=True); self.thread.start()
 
     def _run(self):
+        self.started_at = int(time.time()); failures = 0
         while not self.stop.is_set():
-            self.service.collect_once()
-            self.stop.wait(max(10, int(self.interval_getter() or 60)))
+            result = self.service.collect_once(); failures = self.service.consecutive_failures
+            base = max(10, int(self.interval_getter() or 60)); delay = min(base * (2 ** min(failures, 5)), 1800)
+            self.service.next_attempt = int(time.time() + delay)
+            self.stop.wait(delay)

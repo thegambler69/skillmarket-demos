@@ -154,6 +154,13 @@ class ResearchStore:
                   key TEXT PRIMARY KEY,
                   value_json TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS research_cache (
+                  cache_key TEXT PRIMARY KEY,
+                  updated_at INTEGER NOT NULL,
+                  payload_json TEXT NOT NULL,
+                  stale INTEGER NOT NULL DEFAULT 0,
+                  error TEXT
+                );
                 CREATE TABLE IF NOT EXISTS strategy_definitions (
                   id INTEGER PRIMARY KEY,
                   name TEXT NOT NULL,
@@ -390,6 +397,36 @@ class ResearchStore:
     def counts(self) -> dict[str, int]:
         with self._lock, self._connect() as conn:
             return {name: int(conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]) for name in ("token_snapshots", "research_signals", "smart_money_events", "tracked_wallets", "wallet_clusters")}
+
+    def save_cache(self, key: str, payload: Any, updated_at: int | None = None, stale: bool = False, error: str | None = None) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("INSERT OR REPLACE INTO research_cache(cache_key,updated_at,payload_json,stale,error) VALUES(?,?,?,?,?)",
+                         (key, int(updated_at or time.time()), json.dumps(payload, separators=(",", ":"), default=str), int(stale), error))
+
+    def load_cache(self, key: str) -> dict[str, Any] | None:
+        with self._lock, self._connect() as conn: row = conn.execute("SELECT * FROM research_cache WHERE cache_key=?", (key,)).fetchone()
+        if not row: return None
+        return {"updated_at": row["updated_at"], "payload": json.loads(row["payload_json"]), "stale": bool(row["stale"]), "error": row["error"]}
+
+    def db_size(self) -> int:
+        try: return int(self.path.stat().st_size)
+        except OSError: return 0
+
+    def maintenance(self, action: str) -> dict[str, Any]:
+        if action not in {"checkpoint", "vacuum", "integrity"}: raise ValueError("unsupported maintenance action")
+        with self._lock, self._connect() as conn:
+            if action == "checkpoint": result = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+            elif action == "vacuum": conn.execute("VACUUM"); result = [["ok"]]
+            else: result = conn.execute("PRAGMA integrity_check").fetchall()
+        return {"action": action, "result": result}
+
+    def backup(self, destination: Path) -> dict[str, Any]:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            src = self._connect(); dst = sqlite3.connect(destination)
+            try: src.backup(dst)
+            finally: dst.close(); src.close()
+        return {"path": str(destination), "size": int(destination.stat().st_size)}
 
     def historical_snapshots(self, chain: str = "sol", address: str | None = None,
                              start_ts: int | None = None, end_ts: int | None = None) -> list[dict[str, Any]]:

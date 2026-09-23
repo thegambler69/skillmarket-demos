@@ -226,6 +226,23 @@ def smart_interval():
 SMART_MONEY = SmartMoneyService(RESEARCH, RESEARCH_STORE, research_setting)
 SMART_COLLECTOR = SmartMoneyCollector(SMART_MONEY, smart_interval)
 REPLAY_ENGINE = ReplayEngine(RESEARCH_STORE)
+MARKET_HEALTH = {"last_attempt": None, "last_success": None, "consecutive_failures": 0, "failed_calls": 0, "rate_limit_events": 0, "attempts": 0, "last_error": None}
+MARKET_COLLECTOR_STOP = threading.Event()
+MARKET_COLLECTOR_THREAD = None
+MARKET_COLLECTOR_STARTED = None
+MARKET_COLLECTOR_PAUSED = False
+
+def _market_collector_loop():
+    global MARKET_COLLECTOR_STARTED
+    MARKET_COLLECTOR_STARTED = int(time.time()); delay = 30
+    while not MARKET_COLLECTOR_STOP.is_set():
+        if not MARKET_COLLECTOR_PAUSED:
+            try:
+                api_research_live_market(50); delay = 30 if MARKET_HEALTH["consecutive_failures"] == 0 else min(delay * 2, 1800)
+            except Exception:
+                delay = min(max(30, delay * 2), 1800)
+            MARKET_HEALTH["next_attempt"] = int(time.time() + delay)
+        MARKET_COLLECTOR_STOP.wait(delay)
 
 # ──────────────────────────────────────────────────────────────────────────
 # 2. GMGN 适配器
@@ -1916,9 +1933,12 @@ def api_run(r: RunIn):
 @app.get("/api/research/live-market")
 def api_research_live_market(limit: int = 50):
     """Shared cached Solana feed. This endpoint never invokes trading code."""
+    MARKET_HEALTH["last_attempt"] = int(time.time())
+    MARKET_HEALTH["attempts"] += 1
     try:
         now = int(time.time())
         raw_rows = RESEARCH.trending_sol(max(5, min(limit, 100)))
+        upstream_error = RESEARCH.last_error("trending:sol:1h")
         rows = []
         for raw in raw_rows:
             row = normalize_trending(raw, now)
@@ -1933,10 +1953,23 @@ def api_research_live_market(limit: int = 50):
             row["rank_change"] = previous.get("rank", 0) - row["rank"] if previous and previous.get("rank") is not None else None
             row["score_change"] = row["priority_score"] - previous["priority_score"] if previous else None
             rows.append(row)
+        if upstream_error:
+            MARKET_HEALTH["consecutive_failures"] += 1; MARKET_HEALTH["failed_calls"] += 1; MARKET_HEALTH["last_error"] = upstream_error
+            if "429" in upstream_error or "rate limit" in upstream_error.lower(): MARKET_HEALTH["rate_limit_events"] += 1
+            cached = RESEARCH_STORE.load_cache("live_market")
+            last_success = (cached or {}).get("updated_at")
+            return {"chain":"sol", "timestamp":now, "rows":rows, "signals":RESEARCH_STORE.recent_signals("sol",100), "stale":True, "last_success_timestamp":last_success, "error":upstream_error}
+        MARKET_HEALTH.update(last_success=now, consecutive_failures=0, last_error=None)
+        RESEARCH_STORE.save_cache("live_market", rows, now, False, None)
         return {"chain": "sol", "timestamp": now, "rows": rows,
-                "signals": RESEARCH_STORE.recent_signals("sol", 100), "stale": False}
+                "signals": RESEARCH_STORE.recent_signals("sol", 100), "stale": False, "last_success_timestamp": now}
     except Exception as exc:
-        raise HTTPException(502, f"Live market refresh failed: {exc}")
+        message = str(exc); MARKET_HEALTH["consecutive_failures"] += 1; MARKET_HEALTH["failed_calls"] += 1; MARKET_HEALTH["last_error"] = message
+        if "429" in message or "rate limit" in message.lower(): MARKET_HEALTH["rate_limit_events"] += 1
+        cached = RESEARCH_STORE.load_cache("live_market")
+        if cached:
+            return {"chain":"sol", "timestamp":int(time.time()), "rows":cached["payload"], "signals":RESEARCH_STORE.recent_signals("sol",100), "stale":True, "last_success_timestamp":cached["updated_at"], "error":message}
+        raise HTTPException(502, f"Live market refresh failed: {message}")
 
 @app.post("/api/research/token-inspector")
 def api_research_token_inspector(request: TokenInspectIn):
@@ -2011,10 +2044,44 @@ def api_research_status():
 
 def smart_status() -> dict:
     counts = RESEARCH_STORE.counts()
-    return {"gmgn_connection": "error" if SMART_MONEY.last_error else ("connected" if SMART_MONEY.last_success else "starting"),
+    cache = RESEARCH_STORE.load_cache("live_market")
+    try:
+        version = subprocess.run(["gmgn-cli", "--version"], capture_output=True, text=True, timeout=5, check=False).stdout.strip() or "unknown"
+    except Exception: version = "unavailable"
+    db_counts = {**counts, "backtests": len(RESEARCH_STORE.backtest_runs(200))}
+    return {"gmgn_cli_version": version, "gmgn_auth": "configured" if load_env().get("GMGN_API_KEY") else "missing",
+            "gmgn_connection": "error" if SMART_MONEY.last_error else ("connected" if SMART_MONEY.last_success else "starting"),
             "last_successful_update": SMART_MONEY.last_success, "tracked_wallet_count": counts["tracked_wallets"],
-            "recent_event_count": counts["smart_money_events"], "database": "ok", "collector_running": bool(SMART_COLLECTOR.thread and SMART_COLLECTOR.thread.is_alive()),
-            "stale": SMART_MONEY.stale, "error": SMART_MONEY.last_error, "settings": api_research_settings()}
+            "recent_event_count": counts["smart_money_events"], "database": "ok", "database_path": str(RESEARCH_STORE.path), "database_size": RESEARCH_STORE.db_size(), "counts": db_counts,
+            "market_collector": {"running": bool(MARKET_COLLECTOR_THREAD and MARKET_COLLECTOR_THREAD.is_alive()), "paused": MARKET_COLLECTOR_PAUSED, "started_at": MARKET_COLLECTOR_STARTED, **MARKET_HEALTH, "stale": bool(cache and cache.get("stale"))},
+            "smart_money_collector": {"running": bool(SMART_COLLECTOR.thread and SMART_COLLECTOR.thread.is_alive()), "started_at": SMART_COLLECTOR.started_at, "last_attempt": SMART_MONEY.last_attempt, "last_success": SMART_MONEY.last_success, "next_attempt": SMART_MONEY.next_attempt, "consecutive_failures": SMART_MONEY.consecutive_failures, "rate_limit_events": SMART_MONEY.rate_limit_events, "last_error": SMART_MONEY.last_error, "stale": SMART_MONEY.stale},
+            "stale": SMART_MONEY.stale or bool(cache and cache.get("stale")), "error": SMART_MONEY.last_error or MARKET_HEALTH.get("last_error"), "settings": api_research_settings()}
+
+@app.get("/api/research/quality")
+def api_research_quality():
+    now = int(time.time()); start = now - (now % 86400)
+    rows = RESEARCH_STORE.historical_snapshots("sol", start_ts=start, end_ts=now)
+    quality = REPLAY_ENGINE.data_quality(rows)
+    attempts = MARKET_HEALTH["attempts"]
+    quality.update({"snapshots_today": len(rows), "unique_tokens_today": len({r["address"] for r in rows}), "gmgn_failed_calls": MARKET_HEALTH["failed_calls"], "gmgn_rate_limit_events": MARKET_HEALTH["rate_limit_events"], "expected_scan_cycles_completed_pct": (100.0 * max(0, attempts - MARKET_HEALTH["failed_calls"]) / attempts if attempts else None)})
+    return quality
+
+@app.post("/api/research/collector")
+def api_research_collector(action: str):
+    global MARKET_COLLECTOR_PAUSED
+    if action not in {"pause", "resume"}: raise HTTPException(400, "action must be pause or resume")
+    MARKET_COLLECTOR_PAUSED = action == "pause"
+    return smart_status()
+
+@app.post("/api/research/maintenance")
+def api_research_maintenance(action: str):
+    try: return RESEARCH_STORE.maintenance(action)
+    except ValueError as exc: raise HTTPException(400, str(exc))
+
+@app.post("/api/research/backup")
+def api_research_backup():
+    stamp = time.strftime("%Y-%m-%d-%H%M%S", time.localtime())
+    return RESEARCH_STORE.backup(OUT_DIR / "backups" / f"gmgn-{stamp}.db")
 
 @app.get("/api/research/wallet-history")
 def api_research_wallet_history(address: str | None = None, chain: str = "sol", limit: int = 50):
@@ -2207,11 +2274,15 @@ def index():
 
 @app.on_event("startup")
 def _maybe_start_public_broadcast():
+    global MARKET_COLLECTOR_THREAD
     # 公开演示模式：启动后台守护线程定时刷新真实筛选缓存（仅此线程触发 CLI）。
     if PUBLIC_DEMO:
         threading.Thread(target=_public_broadcast_loop, daemon=True).start()
     else:
         SMART_COLLECTOR.start()
+        if not MARKET_COLLECTOR_THREAD or not MARKET_COLLECTOR_THREAD.is_alive():
+            MARKET_COLLECTOR_THREAD = threading.Thread(target=_market_collector_loop, name="gmgn-market", daemon=True)
+            MARKET_COLLECTOR_THREAD.start()
 
 if __name__ == "__main__":
     import uvicorn

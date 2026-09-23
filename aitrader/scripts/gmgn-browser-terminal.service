@@ -1,0 +1,14 @@
+[Unit]
+Description=GMGN browser research terminal
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/gmgn-demos/aitrader
+ExecStart=%h/gmgn-demos/aitrader/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 8011
+Restart=on-failure
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

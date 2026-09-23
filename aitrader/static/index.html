@@ -405,6 +405,7 @@ td{padding:5px 10px;vertical-align:middle}
         <button id="tabInspector" onclick="switchView('inspector')">TOKEN INSPECTOR</button>
         <button id="tabSmart" onclick="switchView('smart')">SMART MONEY</button>
         <button id="tabReplay" onclick="switchView('replay')">REPLAY / BACKTEST</button>
+        <button id="tabHealth" onclick="switchView('health')">HEALTH</button>
         <button id="tabWallet" onclick="switchView('wallet')" data-i18n="tab_wallet">钱包评估</button>
       </div>
     </div>
@@ -494,6 +495,11 @@ td{padding:5px 10px;vertical-align:middle}
     <div class="smart-settings"><label>From <input id="rpFrom" type="datetime-local"></label><label>To <input id="rpTo" type="datetime-local"></label><label>Signal <select id="rpSignal"><option value="">Any</option><option>FIRST_SEEN</option><option>SMART_MONEY_ENTRY</option><option>KOL_ENTRY</option><option>WALLET_CLUSTER_ENTRY</option><option>SCORE_JUMP</option><option>MC_CROSS</option></select></label><label>Min priority <input id="rpPriority" type="number" value="0"></label><label>Min SM <input id="rpSm" type="number" value="0"></label><label>Min liquidity <input id="rpLiq" type="number" value="0"></label><label>Max bundler <input id="rpBund" type="number" step=".01" value="1"></label><button class="research-go" onclick="runReplay()">Replay</button><button class="research-go" onclick="runBacktest()">Backtest</button></div>
     <div class="smart-settings"><label>Entry signals <input id="btSignals" value="FIRST_SEEN,SMART_MONEY_ENTRY,WALLET_CLUSTER_ENTRY"></label><label>Speed <select id="rpSpeed"><option value="1">1x</option><option value="5">5x</option><option value="20">20x</option><option value="100">100x</option></select></label><button class="research-go" onclick="stepReplay()">Step</button><button class="research-go" onclick="toggleReplay()">Play / Pause</button><a class="research-go" href="/api/research/signal-performance.csv">Signal CSV</a><a class="research-go" href="/api/research/strategy-results.csv">Strategy CSV</a></div>
     <div id="replayStatus" class="lifecycle">No replay loaded.</div><div id="replayResult" class="wlt-empty">Select a range and run replay or backtest.</div>
+  </div></div>
+  <div id="viewHealth" class="view" style="display:none"><div class="research">
+    <div class="research-head"><h2>System Health</h2><button class="research-go" onclick="loadHealth()">Refresh</button></div>
+    <div class="smart-settings"><button class="research-go" onclick="collectorAction('pause')">Pause market collector</button><button class="research-go" onclick="collectorAction('resume')">Resume market collector</button><button class="research-go" onclick="maintenance('checkpoint')">WAL checkpoint</button><button class="research-go" onclick="maintenance('integrity')">Integrity check</button><button class="research-go" onclick="maintenance('vacuum')">VACUUM</button><button class="research-go" onclick="createBackup()">Create SQLite backup</button></div>
+    <pre id="healthResult" class="lifecycle">Loading health…</pre><pre id="qualityResult" class="lifecycle"></pre>
   </div></div>
 </div>
 
@@ -1790,6 +1796,10 @@ function renderReplay(){const e=replayState.events[replayState.index-1];document
 function stepReplay(){if(replayState.index<replayState.events.length){replayState.index++;renderReplay();}}
 function toggleReplay(){replayState.playing=!replayState.playing;if(replayState.playing){const speed=+(document.getElementById('rpSpeed').value||1);replayState.timer=setInterval(()=>{if(replayState.index>=replayState.events.length){replayState.playing=false;clearInterval(replayState.timer);return;}stepReplay();},Math.max(20,500/speed));}else clearInterval(replayState.timer);}
 async function runBacktest(){try{const r=await fetch(API+'/api/research/backtest',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(replayConfig())});if(!r.ok)throw new Error('HTTP '+r.status);const d=await r.json(),m=d.result||{};document.getElementById('replayStatus').textContent=`Run ${d.run_id} · signals ${m.number_signals||0} · valid ${m.valid_entries||0} · incomplete ${m.incomplete||0}`;document.getElementById('replayResult').innerHTML='<pre>'+rEsc(JSON.stringify(m,null,2))+'</pre>'; }catch(e){toast(e.message,'err');}}
+async function loadHealth(){try{const h=await (await fetch(API+'/api/research/status')).json(),q=await (await fetch(API+'/api/research/quality')).json();document.getElementById('healthResult').textContent=JSON.stringify(h,null,2);document.getElementById('qualityResult').textContent=JSON.stringify(q,null,2);}catch(e){toast(e.message,'err');}}
+async function collectorAction(action){try{await fetch(API+'/api/research/collector?'+new URLSearchParams({action}),{method:'POST'});loadHealth();}catch(e){toast(e.message,'err');}}
+async function maintenance(action){try{const r=await fetch(API+'/api/research/maintenance?'+new URLSearchParams({action}),{method:'POST'});if(!r.ok)throw new Error('HTTP '+r.status);toast(JSON.stringify(await r.json()),'ok');loadHealth();}catch(e){toast(e.message,'err');}}
+async function createBackup(){try{const r=await fetch(API+'/api/research/backup',{method:'POST'});if(!r.ok)throw new Error('HTTP '+r.status);toast('Backup created: '+(await r.json()).path,'ok');}catch(e){toast(e.message,'err');}}
 function openTokenDetail(address){const input=document.getElementById('inspectAddr');if(input)input.value=address;switchView('inspector');inspectToken();}
 async function inspectToken(){
   const address=(document.getElementById('inspectAddr').value||'').trim();
@@ -1818,16 +1828,19 @@ function switchView(v){
   document.getElementById('tabInspector').classList.toggle('on',v==='inspector');
   document.getElementById('tabSmart').classList.toggle('on',v==='smart');
   document.getElementById('tabReplay').classList.toggle('on',v==='replay');
+  document.getElementById('tabHealth').classList.toggle('on',v==='health');
   document.getElementById('tabWallet').classList.toggle('on',v==='wallet');
   document.getElementById('viewToken').style.display=v==='token'?'flex':'none';
   document.getElementById('viewLive').style.display=v==='live'?'block':'none';
   document.getElementById('viewInspector').style.display=v==='inspector'?'block':'none';
   document.getElementById('viewSmart').style.display=v==='smart'?'block':'none';
   document.getElementById('viewReplay').style.display=v==='replay'?'block':'none';
+  document.getElementById('viewHealth').style.display=v==='health'?'block':'none';
   document.getElementById('viewWallet').style.display=v==='wallet'?'block':'none';
   if(v==='live'){loadLiveMarket();if(!liveMarketTimer)liveMarketTimer=setInterval(()=>{if(!document.hidden&&curView==='live')loadLiveMarket();},15000);}
   if(v==='wallet'){const a=document.getElementById('wltAddr');if(a)a.focus();}
   if(v==='smart'){loadSmartSettings();loadSmartMoney();if(!smartMoneyTimer)smartMoneyTimer=setInterval(()=>{if(!document.hidden&&curView==='smart')loadSmartMoney();},30000);}
+  if(v==='health'){loadHealth();}
 }
 
 async function runWallet(){

@@ -45,6 +45,7 @@ class GMGNResearchService:
         self.min_request_gap_s = min_request_gap_s
         self._cache: dict[str, CachedValue] = {}
         self._last_good: dict[str, Any] = {}
+        self._last_errors: dict[str, str] = {}
         self._lock = threading.RLock()
         self._last_request = 0.0
         # GMGN Free is a 5/5 leaky bucket. Use that conservative baseline even
@@ -109,11 +110,16 @@ class GMGNResearchService:
                     raise RuntimeError(result.get("message") or result.get("error") or "GMGN returned an error")
                 self._cache[cache_key] = CachedValue(result, time.monotonic() + ttl)
                 self._last_good[cache_key] = result
+                self._last_errors.pop(cache_key, None)
                 return result
-            except Exception:
+            except Exception as exc:
+                self._last_errors[cache_key] = str(exc)
                 if cache_key in self._last_good:
                     return self._last_good[cache_key]
                 raise
+
+    def last_error(self, cache_key: str) -> str | None:
+        with self._lock: return self._last_errors.get(cache_key)
 
     @staticmethod
     def _data(result: Any) -> dict[str, Any]:
