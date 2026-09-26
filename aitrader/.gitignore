@@ -1,6 +1,13 @@
 __pycache__/
 *.pyc
 .venv/
+.deps/
+.wheels/
+.pip-temp*/
+server.pid
+server.stdout.log
+server.stderr.log
+python-write-test.txt
 outputs/*.jsonl
 outputs/*.log
 outputs/*.json
