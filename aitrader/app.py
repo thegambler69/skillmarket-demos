@@ -2310,6 +2310,104 @@ def _attach_survivor_crossover(token_rows: list[dict]) -> dict:
     }
 
 
+def _build_survivor_smart_candidates(token_rows: list[dict]) -> dict:
+    """Build a transparent Survivor × Smart/KOL candidate view.
+
+    This is intentionally not a score. Each condition is exposed separately so
+    it can later be calibrated against observed outcomes rather than assigned
+    arbitrary weights.
+    """
+    rows = []
+    strict_candidates = []
+
+    for token in token_rows:
+        survivor = token.get("survivor") or {}
+
+        if not token.get("eligible"):
+            continue
+        if survivor.get("matched") is not True:
+            continue
+
+        windows = token.get("windows") or {}
+        w15 = windows.get("15m") or {}
+        passed = survivor.get("passed_checkpoints") or []
+
+        buyers_15m = int(w15.get("unique_buyers") or 0)
+        qualified_flow_15m = float(
+            w15.get("qualified_net_flow_usd") or 0.0
+        )
+        convergence_15m = bool(
+            w15.get("smart_kol_convergence")
+        )
+
+        conditions = {
+            "survived_15m_checkpoint": "15m" in passed,
+            "independent_buyers_15m_ge_2": buyers_15m >= 2,
+            "smart_kol_convergence_15m": convergence_15m,
+            "positive_qualified_flow_15m": qualified_flow_15m > 0,
+        }
+
+        strict_candidate = all(conditions.values())
+
+        row = {
+            "token_address": token.get("token_address"),
+            "symbol": token.get("symbol"),
+            "asset_class": token.get("asset_class"),
+            "gmgn_launchpad": token.get("launchpad"),
+            "survivor_launchpad": survivor.get("launchpad"),
+            "created_at": survivor.get("created_at"),
+            "survival_state": survivor.get("survival_state"),
+            "max_survived_ms": survivor.get("max_survived_ms"),
+            "highest_passed_checkpoint":
+                survivor.get("highest_passed_checkpoint"),
+            "passed_checkpoints": passed,
+
+            "buyers_15m": buyers_15m,
+            "smart_buyers_15m": int(w15.get("smart_buyers") or 0),
+            "kol_buyers_15m": int(w15.get("kol_buyers") or 0),
+            "buy_events_15m": int(w15.get("buy_events") or 0),
+            "transactions_per_unique_buyer_15m":
+                w15.get("transactions_per_unique_buyer"),
+            "smart_kol_convergence_15m": convergence_15m,
+            "qualified_flow_15m_usd": qualified_flow_15m,
+            "observed_flow_15m_usd":
+                float(w15.get("observed_net_flow_usd") or 0.0),
+            "buyer_acceleration_15m":
+                w15.get("buyer_acceleration"),
+            "newly_observed_buyers_15m":
+                int(w15.get("newly_observed_buyers") or 0),
+
+            "conditions": conditions,
+            "strict_candidate": strict_candidate,
+        }
+
+        rows.append(row)
+
+        if strict_candidate:
+            strict_candidates.append(row)
+
+    return {
+        "version": "survivor-smart-kol-candidates-1",
+        "scoring_enabled": False,
+        "ranking_method": None,
+        "rules": {
+            "checkpoint": "15m",
+            "min_independent_buyers_15m": 2,
+            "require_independent_smart_kol_convergence_15m": True,
+            "require_positive_qualified_flow_15m": True,
+        },
+        "semantics": (
+            "strict_candidate means every displayed rule is currently true. "
+            "It is a transparent filter, not a prediction, recommendation, "
+            "probability, or weighted score."
+        ),
+        "matched_eligible_tokens": len(rows),
+        "strict_candidate_count": len(strict_candidates),
+        "strict_candidates": strict_candidates,
+        "rows": rows,
+    }
+
+
 @app.get("/api/research/smart-money/intelligence")
 def api_research_smart_money_intelligence(window: str = "24h", wallet_type: str = "all",
                                           activity_limit: int = 250):
@@ -2331,9 +2429,18 @@ def api_research_smart_money_intelligence(window: str = "24h", wallet_type: str 
     payload["survivor_crossover"] = _attach_survivor_crossover(
         payload.get("tokens") or []
     )
+
+    payload["candidate_view"] = _build_survivor_smart_candidates(
+        payload.get("tokens") or []
+    )
+
     payload.setdefault("methodology", {})["survivor"] = (
         "Exact mint-address crossover with the local Survivor launch registry. "
         "This read-only lookup makes no GMGN call and does not share SQLite files."
+    )
+    payload["methodology"]["candidate_view"] = (
+        "Transparent Survivor x Smart/KOL condition filter. Conditions are "
+        "reported individually and are not combined into a weighted score."
     )
 
     payload.update({
