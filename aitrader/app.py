@@ -290,6 +290,7 @@ class GMGNAdapter:
     def token_security(self, addr) -> dict: raise NotImplementedError
     def token_holders(self, addr) -> dict: raise NotImplementedError
     def portfolio_stats(self, wallet) -> dict: raise NotImplementedError
+    def portfolio_holdings(self, wallet, limit=50, cursor=None) -> dict: raise NotImplementedError
     def wallet_activity(self, wallet, limit=100, cursor=None) -> dict: raise NotImplementedError  # 钱包逐笔交易（进场市值/闪买闪卖）
     def swap(self, **kw) -> dict: raise NotImplementedError
     def order_get(self, order_id) -> dict: raise NotImplementedError
@@ -426,6 +427,13 @@ class LiveGMGN(GMGNAdapter):
         return self._cli("token", "holders", "--address", addr)
 
     def portfolio_stats(self, w):   return self._cli("portfolio", "stats", "--wallet", w, "--period", "7d")
+
+    def portfolio_holdings(self, w, limit=50, cursor=None):
+        args = ["portfolio", "holdings", "--wallet", w, "--limit", str(max(1, min(int(limit), 50))),
+                "--order-by", "usd_value", "--direction", "desc"]
+        if cursor:
+            args += ["--cursor", cursor]
+        return self._cli(*args)
 
     def wallet_activity(self, w, limit=100, cursor=None):
         # 逐笔交易记录：买入行含 price_usd + token.total_supply → 进场市值；买卖时间戳配对 → 持仓时长
@@ -663,6 +671,26 @@ class MockGMGN(GMGNAdapter):
         d = self.db[addr]
         return dict(bundler_ratio=d["bundler_rate"], dev_holding=d["dev_team_hold_rate"],
                     top10_concentration=d["top_10_holder_rate"])
+
+    def portfolio_holdings(self, wallet, limit=50, cursor=None):
+        sp = _mock_wallet_spec(wallet); rnd = random.Random(sp["seed"] + 11)
+        rows = []
+        for i in range(min(8, int(limit or 50))):
+            price = rnd.uniform(0.00002, 0.02); supply = 1_000_000_000.0
+            balance = rnd.uniform(10_000, 5_000_000); usd_value = balance * price
+            cost = usd_value / max(0.2, rnd.uniform(0.6, 2.5)); total_profit = usd_value - cost
+            rows.append(dict(
+                token=dict(token_address=f"{wallet[:5]}HD{i}", symbol=f"HOLD{i}", name=f"Mock Holding {i}",
+                           price=str(price), total_supply=str(int(supply)), liquidity=str(rnd.uniform(20_000, 800_000)),
+                           launchpad_platform="pump.fun"),
+                balance=str(balance), usd_value=str(usd_value), accu_cost=str(cost),
+                history_bought_cost=str(cost * rnd.uniform(1.0, 2.0)), history_sold_income=str(max(0.0, total_profit)),
+                realized_profit=str(total_profit * 0.25), unrealized_profit=str(total_profit * 0.75),
+                total_profit=str(total_profit), total_profit_pnl=(total_profit / cost if cost else 0.0),
+                history_total_buys=rnd.randint(1, 8), history_total_sells=rnd.randint(0, 5),
+                start_holding_at=1_783_000_000 + i * 3600, end_holding_at=None,
+                last_active_timestamp=1_783_600_000 - i * 1200, wallet_token_tags=[]))
+        return {"list": rows, "next": None}
 
     def portfolio_stats(self, wallet):
         # 与 LiveGMGN portfolio stats 同构：按地址原型合成 pnl_stat 分桶 + common 元信息
@@ -2102,6 +2130,82 @@ def api_research_smart_money_intelligence(window: str = "24h", wallet_type: str 
         "status": smart_status(),
     })
     return payload
+
+def _normalize_smart_wallet_holdings(raw: dict) -> dict:
+    body = raw.get("data", raw) if isinstance(raw, dict) else {}
+    rows = body.get("list", []) if isinstance(body, dict) else []
+    next_cursor = body.get("next") if isinstance(body, dict) else None
+
+    def n(value):
+        try: return float(value)
+        except (TypeError, ValueError): return None
+
+    out = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict): continue
+        token = row.get("token") or {}
+        address = token.get("token_address")
+        if not address: continue
+        balance = n(row.get("balance")); cost = n(row.get("accu_cost"))
+        price = n(token.get("price")); supply = n(token.get("total_supply"))
+        out.append({
+            "token_address": address, "symbol": token.get("symbol") or "?",
+            "name": token.get("name") or "", "price": price,
+            "market_cap": (price * supply if price is not None and supply is not None else None),
+            "liquidity": n(token.get("liquidity")),
+            "launchpad": token.get("launchpad_platform") or token.get("launchpad"),
+            "balance": balance, "usd_value": n(row.get("usd_value")), "cost_basis": cost,
+            "avg_cost": (cost / balance if cost is not None and balance not in (None, 0) else None),
+            "history_bought_cost": n(row.get("history_bought_cost")),
+            "history_sold_income": n(row.get("history_sold_income")),
+            "realized_profit": n(row.get("realized_profit")),
+            "unrealized_profit": n(row.get("unrealized_profit")),
+            "total_profit": n(row.get("total_profit")),
+            "total_profit_pnl": n(row.get("total_profit_pnl")),
+            "buy_count": int(n(row.get("history_total_buys")) or 0),
+            "sell_count": int(n(row.get("history_total_sells")) or 0),
+            "start_holding_at": int(n(row.get("start_holding_at")) or 0) or None,
+            "end_holding_at": int(n(row.get("end_holding_at")) or 0) or None,
+            "last_active_timestamp": int(n(row.get("last_active_timestamp")) or 0) or None,
+            "tags": row.get("wallet_token_tags") or [],
+        })
+    return {
+        "holdings": out, "next": next_cursor, "position_count": len(out),
+        "total_usd_value": round(sum(x["usd_value"] or 0.0 for x in out), 6),
+        "total_realized_profit": round(sum(x["realized_profit"] or 0.0 for x in out), 6),
+        "total_unrealized_profit": round(sum(x["unrealized_profit"] or 0.0 for x in out), 6),
+    }
+
+@app.get("/api/research/smart-money/wallet-holdings")
+def api_research_smart_wallet_holdings(wallet: str, refresh: bool = False):
+    try:
+        wallet = RESEARCH.validate_sol_address(wallet)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    cache_key = f"smart-wallet-holdings:sol:{wallet}"
+    cached = RESEARCH_STORE.load_cache(cache_key)
+    now = int(time.time())
+    if cached and not refresh and now - int(cached.get("updated_at") or 0) < 600:
+        return {"chain": "sol", "wallet": wallet, **cached["payload"],
+                "cached": True, "updated_at": cached["updated_at"], "stale": bool(cached.get("stale"))}
+    if SHARED_GMGN_GUARD.blocked():
+        if cached:
+            return {"chain": "sol", "wallet": wallet, **cached["payload"],
+                    "cached": True, "updated_at": cached["updated_at"], "stale": True,
+                    "state": "RATE_LIMITED"}
+        _rate_limit_http("Wallet holdings are temporarily unavailable; no cached holdings exist yet.")
+    try:
+        raw = adapter_for("sol").portfolio_holdings(wallet, limit=50)
+        payload = _normalize_smart_wallet_holdings(raw)
+        RESEARCH_STORE.save_cache(cache_key, payload, now, False, None)
+        return {"chain": "sol", "wallet": wallet, **payload,
+                "cached": False, "updated_at": now, "stale": False, "state": "LIVE"}
+    except Exception as exc:
+        if cached:
+            return {"chain": "sol", "wallet": wallet, **cached["payload"],
+                    "cached": True, "updated_at": cached["updated_at"], "stale": True,
+                    "error": str(exc)}
+        raise HTTPException(502, "Current wallet holdings are temporarily unavailable.")
 
 @app.post("/api/research/smart-money/collect")
 def api_research_smart_money_collect():
