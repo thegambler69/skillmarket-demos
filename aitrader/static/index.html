@@ -1762,15 +1762,21 @@ const rPct=v=>(rNum(v)*100).toFixed(1)+'%';
 const rAge=s=>{s=rNum(s);if(s>=86400)return Math.floor(s/86400)+'d';if(s>=3600)return Math.floor(s/3600)+'h';return Math.max(0,Math.floor(s/60))+'m';};
 const rChg=v=>{const n=rNum(v);return `<span class="${n>0?'jump':''}">${n>=0?'+':''}${n.toFixed(1)}%</span>`;};
 const rEsc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const retryMs=(limited,ts)=>limited&&ts?ts*1000:0;
+const smartMoneyRefreshMs=()=>Math.max(10000,Math.min(60000,Math.round((+document.getElementById('smPoll').value||60)*1000)));
+function restartSmartMoneyTimer(){
+  if(smartMoneyTimer)clearInterval(smartMoneyTimer);
+  smartMoneyTimer=setInterval(()=>{if(!document.hidden&&curView==='smart')loadSmartMoney();},smartMoneyRefreshMs());
+}
 async function loadLiveMarket(manual=false){
   const box=document.getElementById('liveMarketResult');
   if(source!=='backend'){box.innerHTML='<div class="wlt-empty">Live Market needs the local backend and GMGN API configuration.</div>';return;}
-  if(Date.now()/1000 < liveRetryAt){if(manual)toast('GMGN is rate limited; showing cached data until the next retry.','err');return;}
+  if(Date.now() < liveRetryAt){if(manual)toast('GMGN is rate limited; showing cached data until the next retry.','err');return;}
   try{
     const res=await fetch(API+'/api/research/live-market?limit=50');
     if(!res.ok)throw new Error((await res.json()).detail||'Unable to refresh market');
     const data=await res.json();
-    liveRetryAt=data.next_retry_timestamp?data.next_retry_timestamp*1000:0;
+    liveRetryAt=retryMs(data.rate_limited||data.state==='RATE_LIMITED',data.next_retry_timestamp);
     const rows=data.rows||[];
     const table=rows.map(x=>`<tr class="${x.is_new?'newrow':''}" onclick="openTokenDetail('${rEsc(x.address)}')">
       <td>${x.rank}${x.rank_change!=null&&x.rank_change!==0?` <span class="jump">${x.rank_change>0?'▲':'▼'}${Math.abs(x.rank_change)}</span>`:''}</td>
@@ -1787,17 +1793,17 @@ async function loadLiveMarket(manual=false){
 }
 async function loadSmartMoney(manual=false){
   const box=document.getElementById('smartResult'); if(source!=='backend'){box.innerHTML='<div class="wlt-empty">Smart Money needs the local backend and GMGN API configuration.</div>';return;}
-  if(Date.now()/1000 < smartRetryAt){if(manual)toast('GMGN is rate limited; showing cached Smart Money data until the next retry.','err');return;}
+  if(Date.now() < smartRetryAt){if(manual)toast('GMGN is rate limited; showing cached Smart Money data until the next retry.','err');return;}
   try{const r=await fetch(API+'/api/research/smart-money?limit=100');if(!r.ok)throw new Error('HTTP '+r.status);const d=await r.json();
-    const st=d.status||{}, smc=st.smart_money_collector||{}; smartRetryAt=smc.next_attempt?smc.next_attempt*1000:0; const smErr=smc.state==='RATE_LIMITED'?'GMGN is temporarily rate limited; cached activity is being served.':(st.error||''); document.getElementById('smartStatus').innerHTML=`${rEsc(smc.state||((st.stale)?'STALE':'LIVE'))} · GMGN: ${rEsc(st.gmgn_connection)} · collector: ${smc.running?'running':'stopped'} · events: ${st.recent_event_count||0} · wallets: ${st.tracked_wallet_count||0} · last update: ${st.last_successful_update?new Date(st.last_successful_update*1000).toLocaleString():'—'} · next retry/reset: ${rEsc(smc.next_attempt?new Date(smc.next_attempt*1000).toLocaleString():(smc.rate_limit_reset||'—'))}${smErr?' · '+rEsc(smErr):''}`;
+    const st=d.status||{}, smc=st.smart_money_collector||{}; smartRetryAt=retryMs(smc.state==='RATE_LIMITED'||((st.shared_rate_limit||{}).active),smc.next_attempt); const smErr=smc.state==='RATE_LIMITED'?'GMGN is temporarily rate limited; cached activity is being served.':(st.error||''); document.getElementById('smartStatus').innerHTML=`${rEsc(smc.state||((st.stale)?'STALE':'LIVE'))} · GMGN: ${rEsc(st.gmgn_connection)} · collector: ${smc.running?'running':'stopped'} · events: ${st.recent_event_count||0} · wallets: ${st.tracked_wallet_count||0} · last update: ${st.last_successful_update?new Date(st.last_successful_update*1000).toLocaleString():'—'} · next retry/reset: ${rEsc(smc.next_attempt?new Date(smc.next_attempt*1000).toLocaleString():(smc.rate_limit_reset||'—'))}${smErr?' · '+rEsc(smErr):''}`;
     const ev=(d.events||[]).map(x=>`<tr onclick="openTokenDetail('${rEsc(x.token_address)}')"><td>${new Date(x.timestamp*1000).toLocaleString()}</td><td>${rEsc(shortCA(x.wallet))}</td><td>${rEsc(x.wallet_type)}</td><td>${rEsc(x.side)}</td><td><b>${rEsc(x.symbol||'?')}</b><br><small class="ca">${rEsc(shortCA(x.token_address))}</small></td><td>${x.entry_price==null?'—':fmtPrice(x.entry_price)}</td><td>${x.entry_market_cap==null?'—':fmtMc(x.entry_market_cap)}</td><td>${x.trade_amount==null?'—':fmtMc(x.trade_amount)}</td><td>${x.current_price==null?'—':fmtPrice(x.current_price)}</td><td>${x.unrealized_performance==null?'—':rChg(x.unrealized_performance)}</td></tr>`).join('');
     const cl=(d.clusters||[]).map(x=>`<li><b>${rEsc(x.symbol||x.token_address)}</b> · ${x.wallet_count} wallets · ${x.time_span_seconds}s · ${x.participating_wallets.map(w=>rEsc(shortCA(w))).join(', ')}</li>`).join('')||'<li>No deterministic cluster events yet.</li>';
     box.innerHTML=`<div class="research-table"><table><thead><tr><th>Time</th><th>Wallet</th><th>Type</th><th>Side</th><th>Token</th><th>Entry price</th><th>Entry MC</th><th>Amount</th><th>Current</th><th>Performance</th></tr></thead><tbody>${ev||'<tr><td colspan="10">No activity stored yet.</td></tr>'}</tbody></table></div><div class="lifecycle"><b>Wallet cluster entries</b><ul class="inspect-list">${cl}</ul></div>`;
   }catch(e){if(manual)toast(e.message,'err');}
 }
-async function collectSmart(manual=false){if(Date.now()/1000 < smartRetryAt){if(manual)toast('GMGN is rate limited; manual collection is suppressed.','err');return;}try{const r=await fetch(API+'/api/research/smart-money/collect',{method:'POST'});if(!r.ok)throw new Error('HTTP '+r.status);await loadSmartMoney(true);}catch(e){if(manual)toast(e.message,'err');}}
-async function saveSmartSettings(){const body={smart_money_poll_interval:+document.getElementById('smPoll').value,min_wallet_score:+document.getElementById('smScore').value,cluster_min_wallets:+document.getElementById('smCluster').value,cluster_window_seconds:+document.getElementById('smWindow').value,max_tracked_wallets:+document.getElementById('smMax').value};try{const r=await fetch(API+'/api/research/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!r.ok)throw new Error('HTTP '+r.status);toast('Smart Money settings saved','ok');}catch(e){toast(e.message,'err');}}
-async function loadSmartSettings(){try{const d=await (await fetch(API+'/api/research/settings')).json();document.getElementById('smPoll').value=d.smart_money_poll_interval;document.getElementById('smScore').value=d.min_wallet_score;document.getElementById('smCluster').value=d.cluster_min_wallets;document.getElementById('smWindow').value=d.cluster_window_seconds;document.getElementById('smMax').value=d.max_tracked_wallets;}catch(_){} }
+async function collectSmart(manual=false){if(Date.now() < smartRetryAt){if(manual)toast('GMGN is rate limited; manual collection is suppressed.','err');return;}try{const r=await fetch(API+'/api/research/smart-money/collect',{method:'POST'});if(!r.ok)throw new Error('HTTP '+r.status);await loadSmartMoney(true);}catch(e){if(manual)toast(e.message,'err');}}
+async function saveSmartSettings(){const body={smart_money_poll_interval:+document.getElementById('smPoll').value,min_wallet_score:+document.getElementById('smScore').value,cluster_min_wallets:+document.getElementById('smCluster').value,cluster_window_seconds:+document.getElementById('smWindow').value,max_tracked_wallets:+document.getElementById('smMax').value};try{const r=await fetch(API+'/api/research/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!r.ok)throw new Error('HTTP '+r.status);restartSmartMoneyTimer();toast('Smart Money settings saved','ok');}catch(e){toast(e.message,'err');}}
+async function loadSmartSettings(){try{const d=await (await fetch(API+'/api/research/settings')).json();document.getElementById('smPoll').value=d.smart_money_poll_interval;document.getElementById('smScore').value=d.min_wallet_score;document.getElementById('smCluster').value=d.cluster_min_wallets;document.getElementById('smWindow').value=d.cluster_window_seconds;document.getElementById('smMax').value=d.max_tracked_wallets;restartSmartMoneyTimer();}catch(_){} }
 function replayConfig(){const ts=id=>{const v=document.getElementById(id).value;return v?Math.floor(new Date(v).getTime()/1000):null};return {chain:'sol',start_ts:ts('rpFrom'),end_ts:ts('rpTo'),signal_type:document.getElementById('rpSignal').value||null,min_priority_score:+document.getElementById('rpPriority').value||0,min_smart_money_count:+document.getElementById('rpSm').value||0,min_liquidity:+document.getElementById('rpLiq').value||0,max_bundler_pct:+document.getElementById('rpBund').value,entry_signals:document.getElementById('btSignals').value.split(',').map(x=>x.trim()).filter(Boolean)};}
 async function runReplay(){try{const r=await fetch(API+'/api/research/replay',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(replayConfig())});if(!r.ok)throw new Error('HTTP '+r.status);const d=await r.json();replayState={events:d.events||[],index:0,playing:false,timer:null};renderReplay();}catch(e){toast(e.message,'err');}}
 function renderReplay(){const e=replayState.events[replayState.index-1];document.getElementById('replayStatus').textContent=`${replayState.index}/${replayState.events.length} · simulated clock: ${e?new Date(e.timestamp*1000).toLocaleString():'—'}`;const rows=replayState.events.slice(Math.max(0,replayState.index-20),replayState.index).reverse().map(x=>`<tr><td>${new Date(x.timestamp*1000).toLocaleString()}</td><td>${rEsc(x.kind)}</td><td>${rEsc(x.event_type||'snapshot')}</td><td>${rEsc(x.symbol||'?')}</td><td>${rEsc(shortCA(x.token_address))}</td></tr>`).join('');document.getElementById('replayResult').innerHTML=`<div class="research-table"><table><thead><tr><th>Timestamp</th><th>Kind</th><th>Event</th><th>Token</th><th>Address</th></tr></thead><tbody>${rows||'<tr><td colspan="5">No historical events.</td></tr>'}</tbody></table></div>`;}
@@ -1849,7 +1855,7 @@ function switchView(v){
   document.getElementById('viewWallet').style.display=v==='wallet'?'block':'none';
   if(v==='live'){loadLiveMarket();if(!liveMarketTimer)liveMarketTimer=setInterval(()=>{if(!document.hidden&&curView==='live')loadLiveMarket();},15000);}
   if(v==='wallet'){const a=document.getElementById('wltAddr');if(a)a.focus();}
-  if(v==='smart'){loadSmartSettings();loadSmartMoney();if(!smartMoneyTimer)smartMoneyTimer=setInterval(()=>{if(!document.hidden&&curView==='smart')loadSmartMoney();},30000);}
+  if(v==='smart'){loadSmartSettings();loadSmartMoney();if(!smartMoneyTimer)restartSmartMoneyTimer();}
   if(v==='health'){loadHealth();}
 }
 
