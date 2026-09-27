@@ -64,8 +64,15 @@ class SmartMoneyService:
         ts = int(self._num(row.get("timestamp")) or time.time())
         entry = self._num(row.get("price_usd") or row.get("price"))
         amount = self._num(row.get("amount_usd") or row.get("buy_cost_usd") or row.get("cost_usd"))
+        supply = self._num(token.get("total_supply") or row.get("total_supply"))
         m = market.get(address) or {}
         current = self._num(row.get("price_now") or row.get("current_price") or m.get("price"))
+        entry_market_cap = self._num(row.get("entry_market_cap") or row.get("market_cap"))
+        if entry_market_cap is None and entry is not None and supply is not None:
+            entry_market_cap = entry * supply
+        current_market_cap = self._num(row.get("current_market_cap") or m.get("market_cap"))
+        if current_market_cap is None and current is not None and supply is not None:
+            current_market_cap = current * supply
         perf = self._num(row.get("price_change"))
         if perf is None and entry and current: perf = current / entry - 1.0
         event_key = str(row.get("transaction_hash") or row.get("tx_hash") or row.get("id") or f"{wallet}:{address}:{ts}:{side}")
@@ -73,8 +80,8 @@ class SmartMoneyService:
             "event_key": f"{wallet_type}:{event_key}", "timestamp": ts, "chain": "sol", "wallet": wallet,
             "wallet_type": wallet_type, "side": side or "unknown", "token_address": address,
             "symbol": row.get("symbol") or token.get("symbol") or m.get("symbol") or "?",
-            "entry_price": entry, "entry_market_cap": self._num(row.get("entry_market_cap") or row.get("market_cap")),
-            "trade_amount": amount, "current_price": current, "current_market_cap": self._num(row.get("current_market_cap") or m.get("market_cap")),
+            "entry_price": entry, "entry_market_cap": entry_market_cap,
+            "trade_amount": amount, "current_price": current, "current_market_cap": current_market_cap,
             "unrealized_performance": perf, "tags": maker_info.get("tags") or row.get("tags") or [], "raw": row,
         }
 
