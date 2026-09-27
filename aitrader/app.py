@@ -25,6 +25,8 @@ app.py — GMGN AI Trader 本地后端 (FastAPI)
 
 from __future__ import annotations
 import json, os, re, subprocess, random, datetime, pathlib, threading, math, shlex, time
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, asdict
 from typing import Optional
@@ -2107,6 +2109,207 @@ def api_research_smart_money(limit: int = 100, token: str | None = None):
             "tracked_wallets": RESEARCH_STORE.tracked_wallets("sol", int(research_setting("max_tracked_wallets") or 100)),
             "status": smart_status()}
 
+# Local Survivor crossover is read-only and never invokes GMGN.
+# Exact mint address is the join key; launchpad labels are retained independently.
+_SURVIVOR_API_URL = os.getenv(
+    "SURVIVOR_API_URL", "http://127.0.0.1:8080"
+).rstrip("/")
+_SURVIVOR_LOOKUP_TIMEOUT_S = 3.0
+_SURVIVOR_LOOKUP_CACHE_TTL_S = 10.0
+_SURVIVOR_LOOKUP_CACHE_LOCK = threading.RLock()
+_SURVIVOR_LOOKUP_CACHE = {
+    "key": None,
+    "expires_at": 0.0,
+    "payload": None,
+}
+
+_SURVIVOR_CHECKPOINT_ORDER = (
+    "1m", "5m", "10m", "15m", "30m",
+    "1h", "3h", "6h", "12h", "24h",
+)
+
+
+def _survivor_bulk_lookup(addresses: list[str]) -> dict:
+    unique = list(dict.fromkeys(
+        str(address or "").strip()
+        for address in addresses
+        if str(address or "").strip()
+    ))
+
+    if len(unique) > 1000:
+        unique = unique[:1000]
+
+    key = ("sol", tuple(sorted(unique)))
+    now_mono = time.monotonic()
+
+    with _SURVIVOR_LOOKUP_CACHE_LOCK:
+        if (
+            _SURVIVOR_LOOKUP_CACHE["key"] == key
+            and _SURVIVOR_LOOKUP_CACHE["payload"] is not None
+            and _SURVIVOR_LOOKUP_CACHE["expires_at"] > now_mono
+        ):
+            cached = dict(_SURVIVOR_LOOKUP_CACHE["payload"])
+            cached["cache_hit"] = True
+            return cached
+
+    if not unique:
+        return {
+            "available": True,
+            "requested": 0,
+            "found": 0,
+            "missing": 0,
+            "launches": [],
+            "cache_hit": False,
+        }
+
+    body = json.dumps({
+        "chain": "sol",
+        "addresses": unique,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        f"{_SURVIVOR_API_URL}/api/launches/lookup",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(
+            req,
+            timeout=_SURVIVOR_LOOKUP_TIMEOUT_S,
+        ) as response:
+            result = json.load(response)
+
+        if not isinstance(result, dict):
+            raise ValueError("Survivor lookup returned non-object JSON")
+
+        launches = result.get("launches")
+        if not isinstance(launches, list):
+            raise ValueError("Survivor lookup response missing launches array")
+
+        payload = {
+            "available": True,
+            "requested": int(result.get("requested") or len(unique)),
+            "found": int(result.get("found") or 0),
+            "missing": int(result.get("missing") or 0),
+            "launches": launches,
+            "cache_hit": False,
+        }
+
+        with _SURVIVOR_LOOKUP_CACHE_LOCK:
+            _SURVIVOR_LOOKUP_CACHE["key"] = key
+            _SURVIVOR_LOOKUP_CACHE["expires_at"] = (
+                time.monotonic() + _SURVIVOR_LOOKUP_CACHE_TTL_S
+            )
+            _SURVIVOR_LOOKUP_CACHE["payload"] = dict(payload)
+
+        return payload
+
+    except Exception as exc:
+        return {
+            "available": False,
+            "requested": len(unique),
+            "found": None,
+            "missing": None,
+            "launches": [],
+            "cache_hit": False,
+            "error": f"{type(exc).__name__}: {str(exc)[:160]}",
+        }
+
+
+def _attach_survivor_crossover(token_rows: list[dict]) -> dict:
+    addresses = [
+        str(row.get("token_address") or "").strip()
+        for row in token_rows
+        if row.get("token_address")
+    ]
+
+    lookup = _survivor_bulk_lookup(addresses)
+
+    if not lookup["available"]:
+        for row in token_rows:
+            row["survivor"] = {
+                "matched": None,
+                "status": "UNAVAILABLE",
+            }
+
+        return {
+            "available": False,
+            "source": "local_survivor_api",
+            "requested": lookup["requested"],
+            "found": None,
+            "matched_tokens": None,
+            "cache_hit": lookup["cache_hit"],
+            "gmgn_calls": 0,
+            "error": lookup.get("error"),
+        }
+
+    by_address = {
+        str(launch.get("address")): launch
+        for launch in lookup["launches"]
+        if isinstance(launch, dict) and launch.get("address")
+    }
+
+    matched = 0
+
+    for row in token_rows:
+        address = str(row.get("token_address") or "")
+        launch = by_address.get(address)
+
+        if launch is None:
+            row["survivor"] = {
+                "matched": False,
+            }
+            continue
+
+        matched += 1
+        checkpoints = launch.get("checkpoints") or {}
+
+        passed = [
+            checkpoint
+            for checkpoint in _SURVIVOR_CHECKPOINT_ORDER
+            if isinstance(checkpoints.get(checkpoint), dict)
+            and checkpoints[checkpoint].get("status") == "PASSED"
+        ]
+
+        metadata = launch.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        row["survivor"] = {
+            "matched": True,
+            "launchpad": launch.get("launchpad"),
+            "platform": launch.get("platform"),
+            "created_at": launch.get("createdAt"),
+            "first_seen_at": launch.get("firstSeenAt"),
+            "source": launch.get("source"),
+            "lifecycle_stage": launch.get("lifecycleStage"),
+            "survival_state": launch.get("survivalState"),
+            "last_activity_at": launch.get("lastActivityAt"),
+            "max_survived_ms": launch.get("maxSurvivedMs"),
+            "passed_checkpoints": passed,
+            "highest_passed_checkpoint": passed[-1] if passed else None,
+            "checkpoints": checkpoints,
+            "activity_observations": metadata.get("activityObservations"),
+        }
+
+    return {
+        "available": True,
+        "source": "local_survivor_api",
+        "requested": lookup["requested"],
+        "found": lookup["found"],
+        "matched_tokens": matched,
+        "cache_hit": lookup["cache_hit"],
+        "gmgn_calls": 0,
+        "semantics": (
+            "Survivor data means native launch detection and observed checkpoint "
+            "survival. It is not proof of token health while terminal "
+            "deterioration/death/rug classification is not active."
+        ),
+    }
+
+
 @app.get("/api/research/smart-money/intelligence")
 def api_research_smart_money_intelligence(window: str = "24h", wallet_type: str = "all",
                                           activity_limit: int = 250):
@@ -2124,6 +2327,15 @@ def api_research_smart_money_intelligence(window: str = "24h", wallet_type: str 
         wallet_type=None if wallet_type == "all" else wallet_type,
         activity_limit=max(25, min(int(activity_limit), 1000)),
     )
+
+    payload["survivor_crossover"] = _attach_survivor_crossover(
+        payload.get("tokens") or []
+    )
+    payload.setdefault("methodology", {})["survivor"] = (
+        "Exact mint-address crossover with the local Survivor launch registry. "
+        "This read-only lookup makes no GMGN call and does not share SQLite files."
+    )
+
     payload.update({
         "chain": "sol", "window": window, "wallet_type": wallet_type,
         "clusters": RESEARCH_STORE.wallet_clusters("sol", None, 100),
