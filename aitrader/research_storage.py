@@ -306,8 +306,7 @@ class ResearchStore:
         return [dict(row) for row in rows]
 
     def smart_money_intelligence(self, chain: str = "sol", since_ts: int | None = None,
-                                 wallet_type: str | None = None, activity_limit: int = 250,
-                                 max_events: int = 20000) -> dict[str, Any]:
+                                 wallet_type: str | None = None, activity_limit: int = 250) -> dict[str, Any]:
         """Aggregate persisted Smart Money/KOL events without making any GMGN calls.
 
         "Observed holdings" deliberately means the latest side seen for a wallet/token pair is a buy.
@@ -319,15 +318,11 @@ class ResearchStore:
             where.append("timestamp>=?"); args.append(int(since_ts))
         if wallet_type in {"smart_money", "kol"}:
             where.append("wallet_type=?"); args.append(wallet_type)
-        cap = max(100, min(int(max_events), 100000))
-        sql = f"""SELECT * FROM (
-                    SELECT * FROM smart_money_events
-                    WHERE {' AND '.join(where)}
-                    ORDER BY timestamp DESC LIMIT ?
-                  ) ORDER BY timestamp ASC, id ASC"""
-        args.append(cap)
+        sql = f"""SELECT * FROM smart_money_events
+                  WHERE {' AND '.join(where)}
+                  ORDER BY timestamp ASC, id ASC"""
         with self._lock, self._connect() as conn:
-            events = [dict(r) for r in conn.execute(sql, args).fetchall()]
+            events = [dict(r) for r in conn.execute(sql, args)]
 
         def _median(values):
             vals = sorted(float(v) for v in values if v is not None)
@@ -463,7 +458,8 @@ class ResearchStore:
                 "observed_open_positions": len(holding_rows),
                 "first_event_at": events[0]["timestamp"] if events else None,
                 "last_event_at": events[-1]["timestamp"] if events else None,
-                "event_cap": cap, "event_cap_reached": len(events) >= cap,
+                "event_cap": None, "event_cap_reached": False,
+                "aggregation_scope": "all_matching_persisted_events",
             },
             "activity": activity, "holdings": holding_rows[:1000],
             "wallets": wallet_rows[:1000], "tokens": token_rows[:1000],
