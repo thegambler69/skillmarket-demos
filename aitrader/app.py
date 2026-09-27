@@ -2318,6 +2318,8 @@ def _build_survivor_smart_candidates(token_rows: list[dict]) -> dict:
     arbitrary weights.
     """
     rows = []
+    active_15m = []
+    waiting_for_survival = []
     strict_candidates = []
 
     for token in token_rows:
@@ -2333,11 +2335,26 @@ def _build_survivor_smart_candidates(token_rows: list[dict]) -> dict:
         passed = survivor.get("passed_checkpoints") or []
 
         buyers_15m = int(w15.get("unique_buyers") or 0)
+        sellers_15m = int(w15.get("unique_sellers") or 0)
+        buy_events_15m = int(w15.get("buy_events") or 0)
+        sell_events_15m = int(w15.get("sell_events") or 0)
         qualified_flow_15m = float(
             w15.get("qualified_net_flow_usd") or 0.0
         )
+        observed_flow_15m = float(
+            w15.get("observed_net_flow_usd") or 0.0
+        )
         convergence_15m = bool(
             w15.get("smart_kol_convergence")
+        )
+
+        is_active_15m = bool(
+            buyers_15m
+            or sellers_15m
+            or buy_events_15m
+            or sell_events_15m
+            or qualified_flow_15m
+            or observed_flow_15m
         )
 
         conditions = {
@@ -2348,6 +2365,12 @@ def _build_survivor_smart_candidates(token_rows: list[dict]) -> dict:
         }
 
         strict_candidate = all(conditions.values())
+        waiting_for_survival_candidate = bool(
+            not conditions["survived_15m_checkpoint"]
+            and conditions["independent_buyers_15m_ge_2"]
+            and conditions["smart_kol_convergence_15m"]
+            and conditions["positive_qualified_flow_15m"]
+        )
 
         row = {
             "token_address": token.get("token_address"),
@@ -2363,15 +2386,18 @@ def _build_survivor_smart_candidates(token_rows: list[dict]) -> dict:
             "passed_checkpoints": passed,
 
             "buyers_15m": buyers_15m,
+            "sellers_15m": sellers_15m,
             "smart_buyers_15m": int(w15.get("smart_buyers") or 0),
             "kol_buyers_15m": int(w15.get("kol_buyers") or 0),
-            "buy_events_15m": int(w15.get("buy_events") or 0),
+            "buy_events_15m": buy_events_15m,
+            "sell_events_15m": sell_events_15m,
             "transactions_per_unique_buyer_15m":
                 w15.get("transactions_per_unique_buyer"),
             "smart_kol_convergence_15m": convergence_15m,
             "qualified_flow_15m_usd": qualified_flow_15m,
-            "observed_flow_15m_usd":
-                float(w15.get("observed_net_flow_usd") or 0.0),
+            "observed_flow_15m_usd": observed_flow_15m,
+            "active_15m": is_active_15m,
+            "waiting_for_survival": waiting_for_survival_candidate,
             "buyer_acceleration_15m":
                 w15.get("buyer_acceleration"),
             "newly_observed_buyers_15m":
@@ -2383,11 +2409,17 @@ def _build_survivor_smart_candidates(token_rows: list[dict]) -> dict:
 
         rows.append(row)
 
+        if is_active_15m:
+            active_15m.append(row)
+
+        if waiting_for_survival_candidate:
+            waiting_for_survival.append(row)
+
         if strict_candidate:
             strict_candidates.append(row)
 
     return {
-        "version": "survivor-smart-kol-candidates-1",
+        "version": "survivor-smart-kol-candidates-2",
         "scoring_enabled": False,
         "ranking_method": None,
         "rules": {
@@ -2398,11 +2430,18 @@ def _build_survivor_smart_candidates(token_rows: list[dict]) -> dict:
         },
         "semantics": (
             "strict_candidate means every displayed rule is currently true. "
-            "It is a transparent filter, not a prediction, recommendation, "
-            "probability, or weighted score."
+            "waiting_for_survival means the buyer, convergence, and qualified "
+            "flow rules are true while the 15m Survivor checkpoint is still "
+            "false. active_15m means observed Smart/KOL activity exists in the "
+            "current 15m feature window. These are transparent state buckets, "
+            "not predictions, recommendations, probabilities, or weighted scores."
         ),
         "matched_eligible_tokens": len(rows),
+        "active_15m_count": len(active_15m),
+        "waiting_for_survival_count": len(waiting_for_survival),
         "strict_candidate_count": len(strict_candidates),
+        "active_15m": active_15m,
+        "waiting_for_survival": waiting_for_survival,
         "strict_candidates": strict_candidates,
         "rows": rows,
     }
