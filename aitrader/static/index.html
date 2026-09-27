@@ -405,6 +405,15 @@ td{padding:5px 10px;vertical-align:middle}
 .sm-type{font-size:10px;text-transform:uppercase;letter-spacing:.03em}
 @media(max-width:1000px){.sm-summary{grid-template-columns:repeat(3,1fr)}}
 
+
+.sm-wallet-detail{display:none;border:1px solid var(--line);background:var(--ink2);border-radius:10px;padding:14px 16px;margin:12px 0}
+.sm-wallet-detail.on{display:block}
+.sm-wallet-head{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:10px}
+.sm-wallet-head b{font-family:var(--disp);font-size:15px}
+.sm-wallet-actions{display:flex;gap:7px;flex-wrap:wrap}
+.sm-wallet-meta{font-size:10.5px;color:var(--dim);margin-bottom:10px}
+.sm-profit-pos{color:var(--lime);font-weight:700}.sm-profit-neg{color:var(--clay);font-weight:700}
+
 </style>
 </head>
 <body>
@@ -518,6 +527,11 @@ td{padding:5px 10px;vertical-align:middle}
       <button id="smTabTokens" onclick="setSmartView('tokens')">TOKENS</button>
     </div>
     <div id="smartSummary" class="sm-summary"></div>
+    <div id="smartWalletDetail" class="sm-wallet-detail">
+      <div class="sm-wallet-head"><div><span class="research-note">REAL CURRENT HOLDINGS</span><br><b id="smartWalletTitle">—</b></div><div class="sm-wallet-actions"><button class="research-go" id="smartWalletRefresh" onclick="refreshSmartWalletDetail()">Refresh holdings</button><button class="research-go" id="smartWalletDeep" onclick="openWalletEvaluator()">Deep wallet score</button><button class="research-go" onclick="closeSmartWalletDetail()">Close</button></div></div>
+      <div id="smartWalletMeta" class="sm-wallet-meta"></div>
+      <div id="smartWalletBody" class="wlt-empty">Select a wallet to load its real GMGN holdings.</div>
+    </div>
     <div class="sm-note">Observed holdings are inferred from collected GMGN Smart Money/KOL activity: the latest observed side for a wallet/token is BUY. They are not claimed to be the wallet's complete on-chain balance. Deep wallet analysis remains on-demand to protect the GMGN request budget.</div>
     <div id="smartResult" class="wlt-empty">Loading persisted Smart Money / KOL intelligence…</div>
     <details style="margin-top:12px"><summary class="research-note" style="cursor:pointer">Collector settings</summary>
@@ -1837,10 +1851,52 @@ function smMatch(row,q){
   q=q.toLowerCase();
   return [row.wallet,row.wallet_type,row.token_address,row.symbol].some(function(v){return String(v||'').toLowerCase().includes(q);});
 }
-function openSmartWallet(address){
+let smartSelectedWallet=null;
+function smPct(v){
+  if(v==null)return '—';
+  var n=Number(v)*100;return (n>=0?'+':'')+n.toFixed(1)+'%';
+}
+function closeSmartWalletDetail(){
+  smartSelectedWallet=null;
+  var p=document.getElementById('smartWalletDetail');if(p)p.classList.remove('on');
+}
+function openWalletEvaluator(){
+  if(!smartSelectedWallet)return;
+  var address=smartSelectedWallet;
   switchView('wallet');
   var a=document.getElementById('wltAddr');if(a){a.value=address;a.focus();}
-  toast('Wallet loaded. Click Evaluate for deep GMGN portfolio analysis.','ok');
+  toast('Wallet loaded. Click Evaluate for full stats/activity scoring.','ok');
+}
+async function openSmartWallet(address){
+  smartSelectedWallet=address;
+  var p=document.getElementById('smartWalletDetail');if(p)p.classList.add('on');
+  var t=document.getElementById('smartWalletTitle');if(t)t.textContent=address;
+  await loadSmartWalletDetail(address,false);
+}
+async function refreshSmartWalletDetail(){
+  if(smartSelectedWallet)await loadSmartWalletDetail(smartSelectedWallet,true);
+}
+async function loadSmartWalletDetail(address,refresh){
+  var body=document.getElementById('smartWalletBody'),meta=document.getElementById('smartWalletMeta');
+  if(!body||!meta)return;
+  body.innerHTML='<span class="spin"></span> Loading real current holdings…';
+  meta.textContent='GMGN portfolio holdings · signed read-only request · cached for 10 minutes';
+  try{
+    var url=API+'/api/research/smart-money/wallet-holdings?wallet='+encodeURIComponent(address)+'&refresh='+(refresh?'true':'false')+'&_ts='+Date.now();
+    var r=await fetch(url,{cache:'no-store',headers:{'Cache-Control':'no-cache'}});
+    if(!r.ok){var er={};try{er=await r.json();}catch(_){ }throw new Error(er.detail||('HTTP '+r.status));}
+    var d=await r.json();
+    if(address!==smartSelectedWallet)return;
+    var rows=d.holdings||[];
+    meta.textContent='Positions: '+smNum(d.position_count)+' · value: '+smMoney(d.total_usd_value)+' · realized P&L: '+smMoney(d.total_realized_profit)+' · unrealized P&L: '+smMoney(d.total_unrealized_profit)+' · '+(d.cached?'cache':'live')+' · updated '+smWhen(d.updated_at)+(d.stale?' · STALE':'');
+    var h=rows.map(function(x){
+      var pnlClass=Number(x.total_profit||0)>=0?'sm-profit-pos':'sm-profit-neg';
+      return '<tr><td>'+smartTokenButton(x)+'</td><td>'+smNum(x.balance)+'</td><td>'+smMoney(x.usd_value)+'</td><td>'+smMoney(x.cost_basis)+'</td><td>'+smMoney(x.avg_cost)+'</td><td class="'+pnlClass+'">'+smMoney(x.realized_profit)+'</td><td class="'+pnlClass+'">'+smMoney(x.unrealized_profit)+'</td><td class="'+pnlClass+'">'+smMoney(x.total_profit)+'</td><td class="'+pnlClass+'">'+smPct(x.total_profit_pnl)+'</td><td>'+smMoney(x.market_cap)+'</td><td>'+rEsc(x.launchpad||'—')+'</td><td>'+smNum(x.buy_count)+' / '+smNum(x.sell_count)+'</td><td>'+smWhen(x.last_active_timestamp)+'</td></tr>';
+    }).join('');
+    body.innerHTML='<div class="research-table"><table><thead><tr><th>Token</th><th>Balance</th><th>USD value</th><th>Cost basis</th><th>Avg cost</th><th>Realized P&L</th><th>Unrealized P&L</th><th>Total P&L</th><th>P&L %</th><th>Current MC</th><th>Launchpad</th><th>Buys/Sells</th><th>Last active</th></tr></thead><tbody>'+(h||'<tr><td colspan="13">No open holdings returned.</td></tr>')+'</tbody></table></div>';
+  }catch(e){
+    body.innerHTML='<div class="wlt-err">Real holdings unavailable: '+rEsc(e.message)+'. Observed activity above is still available.</div>';
+  }
 }
 function smartWalletButton(address){
   return '<button class="sm-link" data-wallet="'+rEsc(address)+'" onclick="openSmartWallet(this.dataset.wallet)">'+rEsc(shortCA(address))+'</button>';
