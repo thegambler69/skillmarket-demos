@@ -68,8 +68,10 @@ class SmartMoneyService:
         m = market.get(address) or {}
         current = self._num(row.get("price_now") or row.get("current_price") or m.get("price"))
         entry_market_cap = self._num(row.get("entry_market_cap") or row.get("market_cap"))
+        entry_market_cap_source = "GMGN_EXPLICIT" if entry_market_cap is not None else None
         if entry_market_cap is None and entry is not None and supply is not None:
             entry_market_cap = entry * supply
+            entry_market_cap_source = "EVENT_PRICE_X_SUPPLY"
         current_market_cap = self._num(row.get("current_market_cap") or m.get("market_cap"))
         if current_market_cap is None and current is not None and supply is not None:
             current_market_cap = current * supply
@@ -81,6 +83,7 @@ class SmartMoneyService:
             "wallet_type": wallet_type, "side": side or "unknown", "token_address": address,
             "symbol": row.get("symbol") or token.get("symbol") or m.get("symbol") or "?",
             "entry_price": entry, "entry_market_cap": entry_market_cap,
+            "entry_market_cap_source": entry_market_cap_source,
             "trade_amount": amount, "current_price": current, "current_market_cap": current_market_cap,
             "unrealized_performance": perf, "tags": maker_info.get("tags") or row.get("tags") or [], "raw": row,
         }

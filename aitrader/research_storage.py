@@ -91,6 +91,7 @@ class ResearchStore:
                   symbol TEXT,
                   entry_price REAL,
                   entry_market_cap REAL,
+                  entry_market_cap_source TEXT,
                   trade_amount REAL,
                   current_price REAL,
                   current_market_cap REAL,
@@ -204,6 +205,10 @@ class ResearchStore:
             if "rank" not in existing:
                 conn.execute("ALTER TABLE token_snapshots ADD COLUMN rank INTEGER")
 
+            smart_existing = {row[1] for row in conn.execute("PRAGMA table_info(smart_money_events)")}
+            if "entry_market_cap_source" not in smart_existing:
+                conn.execute("ALTER TABLE smart_money_events ADD COLUMN entry_market_cap_source TEXT")
+
     def latest_snapshot(self, chain: str, address: str) -> dict[str, Any] | None:
         with self._lock, self._connect() as conn:
             row = conn.execute(
@@ -285,13 +290,14 @@ class ResearchStore:
         with self._lock, self._connect() as conn:
             cur = conn.execute("""INSERT OR IGNORE INTO smart_money_events
               (event_key,timestamp,chain,wallet,wallet_type,side,token_address,symbol,
-               entry_price,entry_market_cap,trade_amount,current_price,current_market_cap,
+               entry_price,entry_market_cap,entry_market_cap_source,trade_amount,current_price,current_market_cap,
                unrealized_performance,raw_json)
-              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
                 key, int(event.get("timestamp") or time.time()), event.get("chain", "sol"),
                 event.get("wallet", ""), event.get("wallet_type", "smart_money"), event.get("side", ""),
                 event.get("token_address", ""), event.get("symbol") or "", event.get("entry_price"),
-                event.get("entry_market_cap"), event.get("trade_amount"), event.get("current_price"),
+                event.get("entry_market_cap"), event.get("entry_market_cap_source"),
+                event.get("trade_amount"), event.get("current_price"),
                 event.get("current_market_cap"), event.get("unrealized_performance"),
                 json.dumps(event.get("raw", {}), separators=(",", ":"), default=str)))
         return cur.rowcount > 0
