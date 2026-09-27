@@ -2079,6 +2079,30 @@ def api_research_smart_money(limit: int = 100, token: str | None = None):
             "tracked_wallets": RESEARCH_STORE.tracked_wallets("sol", int(research_setting("max_tracked_wallets") or 100)),
             "status": smart_status()}
 
+@app.get("/api/research/smart-money/intelligence")
+def api_research_smart_money_intelligence(window: str = "24h", wallet_type: str = "all",
+                                          activity_limit: int = 250):
+    # SQLite-only view over already collected track smartmoney/kol events.
+    # Browsing this endpoint never spends GMGN request budget.
+    windows = {"1h": 3600, "6h": 21600, "24h": 86400, "3d": 259200, "7d": 604800, "30d": 2592000, "all": None}
+    if window not in windows:
+        raise HTTPException(400, "window must be one of: 1h,6h,24h,3d,7d,30d,all")
+    if wallet_type not in {"all", "smart_money", "kol"}:
+        raise HTTPException(400, "wallet_type must be all, smart_money, or kol")
+    seconds = windows[window]
+    since_ts = int(time.time()) - seconds if seconds is not None else None
+    payload = RESEARCH_STORE.smart_money_intelligence(
+        "sol", since_ts=since_ts,
+        wallet_type=None if wallet_type == "all" else wallet_type,
+        activity_limit=max(25, min(int(activity_limit), 1000)),
+    )
+    payload.update({
+        "chain": "sol", "window": window, "wallet_type": wallet_type,
+        "clusters": RESEARCH_STORE.wallet_clusters("sol", None, 100),
+        "status": smart_status(),
+    })
+    return payload
+
 @app.post("/api/research/smart-money/collect")
 def api_research_smart_money_collect():
     # Explicitly read-only: this calls only track smartmoney/kol commands.
