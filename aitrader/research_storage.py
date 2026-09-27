@@ -315,26 +315,254 @@ class ResearchStore:
                                  wallet_type: str | None = None, activity_limit: int = 250) -> dict[str, Any]:
         """Aggregate persisted Smart Money/KOL events without making any GMGN calls.
 
-        "Observed holdings" deliberately means the latest side seen for a wallet/token pair is a buy.
-        It is not presented as a complete on-chain balance because the track feed can start after a
-        wallet entered a position and can omit transfers or activity outside the retained feed.
+        V2 feature data is deliberately descriptive rather than scored. It separates
+        independent-wallet activity from repeated transactions, classifies obvious
+        base/stable assets, and measures fresh-flow/acceleration over short windows.
         """
         where = ["chain=?"]; args: list[Any] = [chain]
         if since_ts is not None:
             where.append("timestamp>=?"); args.append(int(since_ts))
         if wallet_type in {"smart_money", "kol"}:
             where.append("wallet_type=?"); args.append(wallet_type)
+
         sql = f"""SELECT * FROM smart_money_events
                   WHERE {' AND '.join(where)}
                   ORDER BY timestamp ASC, id ASC"""
+
+        now_ts = int(time.time())
+
+        # Short-window features need 2x the largest window so current 1h can
+        # always be compared with the previous 1h, even when API scope is 1h.
+        feature_history_seconds = 7200
+        feature_where = ["chain=?", "timestamp>=?"]
+        feature_args: list[Any] = [chain, now_ts - feature_history_seconds]
+
+        lifecycle_where = ["chain=?"]
+        lifecycle_args: list[Any] = [chain]
+
+        if wallet_type in {"smart_money", "kol"}:
+            feature_where.append("wallet_type=?")
+            feature_args.append(wallet_type)
+            lifecycle_where.append("wallet_type=?")
+            lifecycle_args.append(wallet_type)
+
+        feature_sql = f"""SELECT * FROM smart_money_events
+                          WHERE {' AND '.join(feature_where)}
+                          ORDER BY timestamp ASC, id ASC"""
+
+        lifecycle_sql = f"""
+            SELECT
+                wallet,
+                token_address,
+                MIN(timestamp) AS first_seen_ts,
+                MIN(CASE WHEN LOWER(side)='buy' THEN timestamp END) AS first_buy_ts,
+                MIN(CASE WHEN LOWER(side)='sell' THEN timestamp END) AS first_sell_ts,
+                SUM(CASE WHEN LOWER(side)='buy' THEN 1 ELSE 0 END) AS buy_events,
+                SUM(CASE WHEN LOWER(side)='sell' THEN 1 ELSE 0 END) AS sell_events
+            FROM smart_money_events
+            WHERE {' AND '.join(lifecycle_where)}
+            GROUP BY wallet, token_address
+        """
+
         with self._lock, self._connect() as conn:
             events = [dict(r) for r in conn.execute(sql, args)]
+            feature_events = [
+                dict(r) for r in conn.execute(feature_sql, feature_args)
+            ]
+            lifecycle_rows = [
+                dict(r) for r in conn.execute(lifecycle_sql, lifecycle_args)
+            ]
+
+        lifecycle_first_buy = {
+            (str(r["wallet"]), str(r["token_address"])):
+                (int(r["first_buy_ts"]) if r["first_buy_ts"] is not None else None)
+            for r in lifecycle_rows
+        }
+
+        lifecycle_by_token: dict[str, list[dict[str, Any]]] = {}
+        for row in lifecycle_rows:
+            lifecycle_by_token.setdefault(
+                str(row["token_address"]), []
+            ).append(row)
+
+        feature_events_by_token: dict[str, list[dict[str, Any]]] = {}
+        for event in feature_events:
+            token = str(event.get("token_address") or "")
+            if token:
+                feature_events_by_token.setdefault(token, []).append(event)
+
+        feature_windows = {
+            "5m": 300,
+            "15m": 900,
+            "30m": 1800,
+            "1h": 3600,
+        }
+
+        # Exact-address exclusions only. Symbols are intentionally not trusted because
+        # arbitrary launch tokens can spoof WSOL/USDC/etc.
+        known_assets = {
+            "So11111111111111111111111111111111111111112":
+                ("BASE_ASSET", False, "known WSOL address"),
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v":
+                ("STABLE_ASSET", False, "known USDC address"),
+            "USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB":
+                ("STABLE_ASSET", False, "known USD1 address"),
+            "cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij":
+                ("MAJOR_WRAPPED_ASSET", False, "known cbBTC address"),
+        }
+
+        def _num(value):
+            try:
+                return float(value) if value is not None else None
+            except (TypeError, ValueError):
+                return None
 
         def _median(values):
             vals = sorted(float(v) for v in values if v is not None)
-            if not vals: return None
+            if not vals:
+                return None
             n = len(vals); mid = n // 2
             return vals[mid] if n % 2 else (vals[mid - 1] + vals[mid]) / 2.0
+
+        def _launchpad(event):
+            try:
+                raw = json.loads(event.get("raw_json") or "{}")
+            except Exception:
+                return None
+            token = raw.get("base_token") or raw.get("token") or {}
+            if not isinstance(token, dict):
+                token = {}
+            value = (
+                token.get("launchpad")
+                or token.get("launchpad_platform")
+                or raw.get("launchpad")
+                or raw.get("launchpad_platform")
+            )
+            value = str(value or "").strip()
+            return value or None
+
+        def _classify(address, launchpads):
+            if address in known_assets:
+                asset_class, eligible, reason = known_assets[address]
+                return {
+                    "asset_class": asset_class,
+                    "eligible": eligible,
+                    "eligibility_reason": reason,
+                }
+
+            observed = sorted(x for x in launchpads if x)
+            if observed:
+                return {
+                    "asset_class": "LAUNCHPAD_TOKEN",
+                    "eligible": True,
+                    "eligibility_reason": "launchpad metadata observed: " + ", ".join(observed),
+                }
+
+            return {
+                "asset_class": "NON_LAUNCH_TOKEN",
+                "eligible": True,
+                "eligibility_reason": "non-base/non-stable asset; no launchpad metadata observed",
+            }
+
+        def _window_metrics(rows):
+            buyers = set()
+            smart_buyers = set()
+            kol_buyers = set()
+            sellers = set()
+            buy_sizes = []
+            entry_mcaps = []
+            buy_usd = 0.0
+            sell_usd = 0.0
+            qualified_sell_usd = 0.0
+            preexisting_exit_sell_usd = 0.0
+            buy_events = 0
+            sell_events = 0
+            wallet_buy_events = {}
+            wallet_buy_usd = {}
+
+            for event in rows:
+                wallet = str(event.get("wallet") or "")
+                side = str(event.get("side") or "").lower()
+                kind = str(event.get("wallet_type") or "smart_money")
+                amount = _num(event.get("trade_amount"))
+                entry_mc = _num(event.get("entry_market_cap"))
+
+                if side == "buy":
+                    buy_events += 1
+                    buyers.add(wallet)
+                    if kind == "kol":
+                        kol_buyers.add(wallet)
+                    else:
+                        smart_buyers.add(wallet)
+
+                    wallet_buy_events[wallet] = wallet_buy_events.get(wallet, 0) + 1
+                    if amount is not None:
+                        buy_usd += amount
+                        buy_sizes.append(amount)
+                        wallet_buy_usd[wallet] = wallet_buy_usd.get(wallet, 0.0) + amount
+                    if entry_mc is not None:
+                        entry_mcaps.append(entry_mc)
+
+                elif side == "sell":
+                    sell_events += 1
+                    sellers.add(wallet)
+                    if amount is not None:
+                        sell_usd += amount
+
+                        token_address = str(event.get("token_address") or "")
+                        event_ts = int(event.get("timestamp") or 0)
+                        first_buy_ts = lifecycle_first_buy.get(
+                            (wallet, token_address)
+                        )
+
+                        if (
+                            first_buy_ts is not None
+                            and first_buy_ts <= event_ts
+                        ):
+                            qualified_sell_usd += amount
+                        else:
+                            preexisting_exit_sell_usd += amount
+
+            largest_buyer_share = None
+            if buy_usd > 0 and wallet_buy_usd:
+                largest_buyer_share = max(wallet_buy_usd.values()) / buy_usd
+
+            return {
+                "unique_buyers": len(buyers),
+                "smart_buyers": len(smart_buyers),
+                "kol_buyers": len(kol_buyers),
+                "unique_sellers": len(sellers),
+                "buy_events": buy_events,
+                "sell_events": sell_events,
+                "buy_usd": round(buy_usd, 6),
+                "sell_usd": round(sell_usd, 6),
+
+                # Legacy/raw observed flow retained for compatibility.
+                "net_flow_usd": round(buy_usd - sell_usd, 6),
+                "observed_net_flow_usd": round(buy_usd - sell_usd, 6),
+
+                # Lifecycle-qualified flow does not treat a first-observed SELL
+                # as proof of fresh bearish positioning.
+                "qualified_sell_usd": round(qualified_sell_usd, 6),
+                "preexisting_exit_sell_usd":
+                    round(preexisting_exit_sell_usd, 6),
+                "qualified_net_flow_usd":
+                    round(buy_usd - qualified_sell_usd, 6),
+
+                "median_buy_size_usd": _median(buy_sizes),
+                "median_entry_market_cap": _median(entry_mcaps),
+                "smart_kol_presence": bool(smart_buyers and kol_buyers),
+                "smart_kol_convergence": bool(
+                    smart_buyers and kol_buyers and len(buyers) >= 2
+                ),
+                "dual_classified_buyers": len(smart_buyers & kol_buyers),
+                "smart_only_buyers": len(smart_buyers - kol_buyers),
+                "kol_only_buyers": len(kol_buyers - smart_buyers),
+                "repeat_buyer_wallets": sum(1 for n in wallet_buy_events.values() if n >= 2),
+                "transactions_per_unique_buyer":
+                    (buy_events / len(buyers)) if buyers else None,
+                "largest_buyer_flow_share": largest_buyer_share,
+            }
 
         tokens: dict[str, dict[str, Any]] = {}
         wallets: dict[str, dict[str, Any]] = {}
@@ -346,93 +574,313 @@ class ResearchStore:
             token = str(e.get("token_address") or "")
             if not wallet or not token:
                 continue
+
             side = str(e.get("side") or "unknown").lower()
             kind = str(e.get("wallet_type") or "smart_money")
-            amount = float(e["trade_amount"]) if e.get("trade_amount") is not None else None
-            entry_mc = float(e["entry_market_cap"]) if e.get("entry_market_cap") is not None else None
-            current_mc = float(e["current_market_cap"]) if e.get("current_market_cap") is not None else None
+            amount = _num(e.get("trade_amount"))
+            entry_mc = _num(e.get("entry_market_cap"))
+            current_mc = _num(e.get("current_market_cap"))
             ts = int(e.get("timestamp") or 0)
-            if side == "buy": total_buys += 1
-            elif side == "sell": total_sells += 1
-            if kind == "kol": kol_events += 1
-            else: smart_events += 1
+            launchpad = _launchpad(e)
+
+            if side == "buy":
+                total_buys += 1
+            elif side == "sell":
+                total_sells += 1
+
+            if kind == "kol":
+                kol_events += 1
+            else:
+                smart_events += 1
 
             t = tokens.setdefault(token, {
-                "token_address": token, "symbol": e.get("symbol") or "?", "wallets": set(),
-                "smart_wallets": set(), "kol_wallets": set(), "buy_events": 0, "sell_events": 0,
-                "buy_usd": 0.0, "sell_usd": 0.0, "entry_mcaps": [], "first_seen": ts,
-                "last_seen": ts, "latest_current_market_cap": None,
+                "token_address": token,
+                "symbol": e.get("symbol") or "?",
+                "wallets": set(),
+                "smart_wallets": set(),
+                "kol_wallets": set(),
+                "buy_events": 0,
+                "sell_events": 0,
+                "buy_usd": 0.0,
+                "sell_usd": 0.0,
+                "entry_mcaps": [],
+                "first_seen": ts,
+                "last_seen": ts,
+                "latest_current_market_cap": None,
+                "_events": [],
+                "_launchpads": set(),
             })
+
             t["symbol"] = e.get("symbol") or t["symbol"]
             t["wallets"].add(wallet)
             t["kol_wallets" if kind == "kol" else "smart_wallets"].add(wallet)
-            t["first_seen"] = min(t["first_seen"], ts); t["last_seen"] = max(t["last_seen"], ts)
-            if side == "buy": t["buy_events"] += 1
-            elif side == "sell": t["sell_events"] += 1
+            t["first_seen"] = min(t["first_seen"], ts)
+            t["last_seen"] = max(t["last_seen"], ts)
+            t["_events"].append(e)
+
+            if launchpad:
+                t["_launchpads"].add(launchpad)
+
+            if side == "buy":
+                t["buy_events"] += 1
+            elif side == "sell":
+                t["sell_events"] += 1
+
             if amount is not None:
-                if side == "buy": t["buy_usd"] += amount
-                elif side == "sell": t["sell_usd"] += amount
-            if entry_mc is not None and side == "buy": t["entry_mcaps"].append(entry_mc)
-            if current_mc is not None: t["latest_current_market_cap"] = current_mc
+                if side == "buy":
+                    t["buy_usd"] += amount
+                elif side == "sell":
+                    t["sell_usd"] += amount
+
+            if entry_mc is not None and side == "buy":
+                t["entry_mcaps"].append(entry_mc)
+
+            if current_mc is not None:
+                t["latest_current_market_cap"] = current_mc
 
             w = wallets.setdefault(wallet, {
-                "wallet": wallet, "types": set(), "tokens": set(), "buy_events": 0, "sell_events": 0,
-                "buy_usd": 0.0, "sell_usd": 0.0, "entry_mcaps": [], "first_seen": ts,
-                "last_seen": ts, "observed_open_positions": 0,
+                "wallet": wallet,
+                "types": set(),
+                "tokens": set(),
+                "buy_events": 0,
+                "sell_events": 0,
+                "buy_usd": 0.0,
+                "sell_usd": 0.0,
+                "entry_mcaps": [],
+                "first_seen": ts,
+                "last_seen": ts,
+                "observed_open_positions": 0,
             })
-            w["types"].add(kind); w["tokens"].add(token)
-            w["first_seen"] = min(w["first_seen"], ts); w["last_seen"] = max(w["last_seen"], ts)
-            if side == "buy": w["buy_events"] += 1
-            elif side == "sell": w["sell_events"] += 1
-            if amount is not None:
-                if side == "buy": w["buy_usd"] += amount
-                elif side == "sell": w["sell_usd"] += amount
-            if entry_mc is not None and side == "buy": w["entry_mcaps"].append(entry_mc)
 
-            p = positions.setdefault((wallet, token), {
-                "wallet": wallet, "token_address": token, "symbol": e.get("symbol") or "?",
-                "types": set(), "buy_events": 0, "sell_events": 0, "buy_usd": 0.0, "sell_usd": 0.0,
-                "entry_mcaps": [], "first_seen": ts, "last_seen": ts, "last_side": side,
+            w["types"].add(kind)
+            w["tokens"].add(token)
+            w["first_seen"] = min(w["first_seen"], ts)
+            w["last_seen"] = max(w["last_seen"], ts)
+
+            if side == "buy":
+                w["buy_events"] += 1
+            elif side == "sell":
+                w["sell_events"] += 1
+
+            if amount is not None:
+                if side == "buy":
+                    w["buy_usd"] += amount
+                elif side == "sell":
+                    w["sell_usd"] += amount
+
+            if entry_mc is not None and side == "buy":
+                w["entry_mcaps"].append(entry_mc)
+
+            pkey = (wallet, token)
+            pstate = positions.setdefault(pkey, {
+                "wallet": wallet,
+                "token_address": token,
+                "symbol": e.get("symbol") or "?",
+                "types": set(),
+                "buy_events": 0,
+                "sell_events": 0,
+                "buy_usd": 0.0,
+                "sell_usd": 0.0,
+                "entry_mcaps": [],
+                "first_seen": ts,
+                "last_seen": ts,
+                "first_side": side,
+                "last_side": side,
                 "latest_current_market_cap": None,
             })
-            p["symbol"] = e.get("symbol") or p["symbol"]; p["types"].add(kind)
-            p["first_seen"] = min(p["first_seen"], ts); p["last_seen"] = max(p["last_seen"], ts)
-            p["last_side"] = side
-            if side == "buy": p["buy_events"] += 1
-            elif side == "sell": p["sell_events"] += 1
+
+            pstate["symbol"] = e.get("symbol") or pstate["symbol"]
+            pstate["types"].add(kind)
+            pstate["first_seen"] = min(pstate["first_seen"], ts)
+            pstate["last_seen"] = max(pstate["last_seen"], ts)
+            pstate["last_side"] = side
+
+            if side == "buy":
+                pstate["buy_events"] += 1
+            elif side == "sell":
+                pstate["sell_events"] += 1
+
             if amount is not None:
-                if side == "buy": p["buy_usd"] += amount
-                elif side == "sell": p["sell_usd"] += amount
-            if entry_mc is not None and side == "buy": p["entry_mcaps"].append(entry_mc)
-            if current_mc is not None: p["latest_current_market_cap"] = current_mc
+                if side == "buy":
+                    pstate["buy_usd"] += amount
+                elif side == "sell":
+                    pstate["sell_usd"] += amount
+
+            if entry_mc is not None and side == "buy":
+                pstate["entry_mcaps"].append(entry_mc)
+
+            if current_mc is not None:
+                pstate["latest_current_market_cap"] = current_mc
+
+        positions_by_token: dict[str, list[dict[str, Any]]] = {}
+        for pstate in positions.values():
+            positions_by_token.setdefault(pstate["token_address"], []).append(pstate)
 
         token_rows = []
+        asset_class_counts: dict[str, int] = {}
+        eligible_token_count = 0
+
         for t in tokens.values():
             median_mc = _median(t.pop("entry_mcaps"))
             latest_mc = t["latest_current_market_cap"]
+            # _events contains the selected API scope. Short-window feature
+            # calculations instead use their own guaranteed 2h context.
+            t.pop("_events")
+            window_events = feature_events_by_token.get(
+                t["token_address"], []
+            )
+            launchpads = t.pop("_launchpads")
+
+            classification = _classify(t["token_address"], launchpads)
+            t.update(classification)
+            t["launchpad"] = ", ".join(sorted(launchpads)) if launchpads else None
+
+            if t["eligible"]:
+                eligible_token_count += 1
+            asset_class_counts[t["asset_class"]] = asset_class_counts.get(t["asset_class"], 0) + 1
+
             t["unique_wallets"] = len(t.pop("wallets"))
-            t["smart_wallets"] = len(t["smart_wallets"]); t["kol_wallets"] = len(t["kol_wallets"])
+            t["smart_wallets"] = len(t["smart_wallets"])
+            t["kol_wallets"] = len(t["kol_wallets"])
             t["median_entry_market_cap"] = median_mc
             t["observed_net_flow_usd"] = round(t["buy_usd"] - t["sell_usd"], 6)
-            t["mcap_multiple"] = (latest_mc / median_mc) if latest_mc and median_mc and median_mc > 0 else None
+            t["mcap_multiple"] = (
+                latest_mc / median_mc
+                if latest_mc and median_mc and median_mc > 0
+                else None
+            )
+
+            token_positions = positions_by_token.get(t["token_address"], [])
+            lifecycle_token_rows = lifecycle_by_token.get(
+                t["token_address"], []
+            )
+
+            t["observation_quality"] = {
+                "first_event_buy_wallets": sum(
+                    1 for row in lifecycle_token_rows
+                    if row["first_buy_ts"] is not None
+                    and (
+                        row["first_sell_ts"] is None
+                        or int(row["first_buy_ts"]) <= int(row["first_sell_ts"])
+                    )
+                ),
+                "first_event_sell_wallets": sum(
+                    1 for row in lifecycle_token_rows
+                    if row["first_sell_ts"] is not None
+                    and (
+                        row["first_buy_ts"] is None
+                        or int(row["first_sell_ts"]) < int(row["first_buy_ts"])
+                    )
+                ),
+                "observed_buyer_wallets": sum(
+                    1 for row in lifecycle_token_rows
+                    if int(row["buy_events"] or 0) > 0
+                ),
+                "repeat_accumulator_wallets": sum(
+                    1 for row in lifecycle_token_rows
+                    if int(row["buy_events"] or 0) >= 2
+                ),
+                "exit_only_wallets": sum(
+                    1 for row in lifecycle_token_rows
+                    if int(row["buy_events"] or 0) == 0
+                    and int(row["sell_events"] or 0) > 0
+                ),
+                "scope": "all_matching_persisted_events",
+            }
+
+            t["windows"] = {}
+            for label, seconds in feature_windows.items():
+                current_cutoff = now_ts - seconds
+                previous_cutoff = now_ts - (2 * seconds)
+
+                current_rows = [
+                    event for event in window_events
+                    if current_cutoff <= int(event.get("timestamp") or 0) <= now_ts
+                ]
+                previous_rows = [
+                    event for event in window_events
+                    if previous_cutoff <= int(event.get("timestamp") or 0) < current_cutoff
+                ]
+
+                current = _window_metrics(current_rows)
+                previous = _window_metrics(previous_rows)
+
+                newly_observed_wallets = set()
+                for event in current_rows:
+                    if str(event.get("side") or "").lower() != "buy":
+                        continue
+
+                    wallet = str(event.get("wallet") or "")
+                    first_buy_ts = lifecycle_first_buy.get(
+                        (wallet, t["token_address"])
+                    )
+
+                    if (
+                        first_buy_ts is not None
+                        and first_buy_ts >= current_cutoff
+                    ):
+                        newly_observed_wallets.add(wallet)
+
+                newly_observed_buyers = len(newly_observed_wallets)
+
+                current.update({
+                    "newly_observed_buyers": newly_observed_buyers,
+                    "previous_unique_buyers": previous["unique_buyers"],
+                    "previous_net_flow_usd": previous["net_flow_usd"],
+                    "previous_qualified_net_flow_usd":
+                        previous["qualified_net_flow_usd"],
+                    "buyer_acceleration":
+                        current["unique_buyers"] - previous["unique_buyers"],
+                    "buyer_acceleration_ratio":
+                        (current["unique_buyers"] / previous["unique_buyers"])
+                        if previous["unique_buyers"] > 0 else None,
+                    "flow_acceleration_usd":
+                        round(
+                            current["net_flow_usd"]
+                            - previous["net_flow_usd"],
+                            6,
+                        ),
+                    "qualified_flow_acceleration_usd":
+                        round(
+                            current["qualified_net_flow_usd"]
+                            - previous["qualified_net_flow_usd"],
+                            6,
+                        ),
+                })
+
+                t["windows"][label] = current
+
             token_rows.append(t)
-        token_rows.sort(key=lambda x: (x["unique_wallets"], x["buy_events"], x["last_seen"]), reverse=True)
+
+        token_rows.sort(
+            key=lambda x: (x["unique_wallets"], x["buy_events"], x["last_seen"]),
+            reverse=True
+        )
 
         holding_rows = []
-        for p in positions.values():
-            if p["last_side"] != "buy":
+        for pstate in positions.values():
+            if pstate["last_side"] != "buy":
                 continue
-            median_mc = _median(p.pop("entry_mcaps"))
-            latest_mc = p["latest_current_market_cap"]
-            p["wallet_type"] = "+".join(sorted(p.pop("types")))
-            p["median_entry_market_cap"] = median_mc
-            p["observed_net_flow_usd"] = round(p["buy_usd"] - p["sell_usd"], 6)
-            p["mcap_multiple"] = (latest_mc / median_mc) if latest_mc and median_mc and median_mc > 0 else None
-            p["status"] = "OBSERVED_OPEN"
-            p["status_method"] = "last-observed-side"
-            holding_rows.append(p)
-            if p["wallet"] in wallets:
-                wallets[p["wallet"]]["observed_open_positions"] += 1
+
+            median_mc = _median(pstate.pop("entry_mcaps"))
+            latest_mc = pstate["latest_current_market_cap"]
+            pstate["wallet_type"] = "+".join(sorted(pstate.pop("types")))
+            pstate["median_entry_market_cap"] = median_mc
+            pstate["observed_net_flow_usd"] = round(
+                pstate["buy_usd"] - pstate["sell_usd"], 6
+            )
+            pstate["mcap_multiple"] = (
+                latest_mc / median_mc
+                if latest_mc and median_mc and median_mc > 0
+                else None
+            )
+            pstate["status"] = "OBSERVED_OPEN"
+            pstate["status_method"] = "last-observed-side"
+            holding_rows.append(pstate)
+
+            if pstate["wallet"] in wallets:
+                wallets[pstate["wallet"]]["observed_open_positions"] += 1
+
         holding_rows.sort(key=lambda x: x["last_seen"], reverse=True)
 
         wallet_rows = []
@@ -442,37 +890,81 @@ class ResearchStore:
             w["median_entry_market_cap"] = _median(w.pop("entry_mcaps"))
             w["observed_net_flow_usd"] = round(w["buy_usd"] - w["sell_usd"], 6)
             wallet_rows.append(w)
-        wallet_rows.sort(key=lambda x: (x["observed_open_positions"], x["buy_events"], x["last_seen"]), reverse=True)
+
+        wallet_rows.sort(
+            key=lambda x: (
+                x["observed_open_positions"],
+                x["buy_events"],
+                x["last_seen"],
+            ),
+            reverse=True
+        )
 
         activity = []
         for e in reversed(events[-max(1, min(int(activity_limit), 1000)):]):
             item = {k: e.get(k) for k in (
-                "id", "timestamp", "wallet", "wallet_type", "side", "token_address", "symbol",
-                "entry_price", "entry_market_cap", "trade_amount", "current_price",
-                "current_market_cap", "unrealized_performance")}
+                "id", "timestamp", "wallet", "wallet_type", "side",
+                "token_address", "symbol", "entry_price", "entry_market_cap",
+                "entry_market_cap_source", "trade_amount", "current_price",
+                "current_market_cap", "unrealized_performance",
+            )}
+
             if item.get("entry_market_cap") and item.get("current_market_cap"):
-                item["mcap_multiple"] = item["current_market_cap"] / item["entry_market_cap"]
+                item["mcap_multiple"] = (
+                    item["current_market_cap"] / item["entry_market_cap"]
+                )
             else:
                 item["mcap_multiple"] = None
+
             activity.append(item)
 
         return {
             "summary": {
-                "events": len(events), "buy_events": total_buys, "sell_events": total_sells,
-                "smart_money_events": smart_events, "kol_events": kol_events,
-                "unique_wallets": len(wallets), "unique_tokens": len(tokens),
+                "events": len(events),
+                "buy_events": total_buys,
+                "sell_events": total_sells,
+                "smart_money_events": smart_events,
+                "kol_events": kol_events,
+                "unique_wallets": len(wallets),
+                "unique_tokens": len(tokens),
                 "observed_open_positions": len(holding_rows),
                 "first_event_at": events[0]["timestamp"] if events else None,
                 "last_event_at": events[-1]["timestamp"] if events else None,
-                "event_cap": None, "event_cap_reached": False,
+                "event_cap": None,
+                "event_cap_reached": False,
                 "aggregation_scope": "all_matching_persisted_events",
             },
-            "activity": activity, "holdings": holding_rows[:1000],
-            "wallets": wallet_rows[:1000], "tokens": token_rows[:1000],
+            "feature_engine": {
+                "version": "smart-kol-v2-features-1",
+                "anchor_timestamp": now_ts,
+                "windows": list(feature_windows),
+                "feature_history_seconds": feature_history_seconds,
+                "lifecycle_scope": "all_matching_persisted_events",
+                "eligible_tokens": eligible_token_count,
+                "asset_class_counts": asset_class_counts,
+                "scoring_enabled": False,
+            },
+            "activity": activity,
+            "holdings": holding_rows[:1000],
+            "wallets": wallet_rows[:1000],
+            "tokens": token_rows[:1000],
             "methodology": {
-                "holdings": "Observed open interest: latest collected side for wallet/token is BUY; not a complete on-chain balance.",
-                "market_caps": "Entry/current market caps are shown only when present in collected GMGN data.",
-                "collection": "Built from persisted track smartmoney + track kol events; viewing this endpoint makes no GMGN call.",
+                "holdings":
+                    "Observed open interest: latest collected side for wallet/token is BUY; not a complete on-chain balance.",
+                "market_caps":
+                    "Buy market caps use persisted event market cap, normally derived from event price x token supply.",
+                "collection":
+                    "Built only from persisted track smartmoney + track kol events; viewing this endpoint makes no GMGN call.",
+                "eligibility":
+                    "Known base/stable/major wrapped assets are excluded by exact address. Launchpad and other non-base assets remain eligible regardless of market cap.",
+                "freshness":
+                    "Short-window features use unique wallets so repeated transactions from one wallet do not masquerade as independent consensus.",
+                "newly_observed_buyers":
+                    "First BUY observed in the full persisted matching history; not proof that it was the wallet's first-ever on-chain purchase.",
+                "flows":
+                    "Observed flow includes every collected sell. Qualified flow subtracts sells only after a prior observed BUY; first-observed/pre-existing exits are reported separately.",
+                "scoring":
+                    "No composite score is assigned in v2 feature mode; features are retained for later outcome-based calibration.",
             },
         }
 
