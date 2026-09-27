@@ -2513,6 +2513,12 @@ def _maybe_start_public_broadcast():
             MARKET_COLLECTOR_THREAD = threading.Thread(target=_market_collector_loop, name="gmgn-market", daemon=True)
             MARKET_COLLECTOR_THREAD.start()
 
+
+# BEGIN BSC-SOL-SCAN SURVIVOR BRIDGE
+from survivor_bridge import install_survivor_bridge
+install_survivor_bridge(app, ST, valid_chain)
+# END BSC-SOL-SCAN SURVIVOR BRIDGE
+
 if __name__ == "__main__":
     import uvicorn
     # 只绑回环：别人填的 key 不会暴露到局域网/公网（公网请走带鉴权/限频的隧道）
