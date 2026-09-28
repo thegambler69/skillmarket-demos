@@ -751,6 +751,23 @@ def _f(v, default=0.0) -> float:
     except (TypeError, ValueError):
         return default
 
+def _num_or_none(v) -> float | None:
+    try:
+        n = float(v)
+    except (TypeError, ValueError):
+        return None
+    return n if math.isfinite(n) else None
+
+MARKET_CAP_FIELD_ORDER = ("market_cap", "usd_market_cap")
+
+def _market_cap_from_trending(row: dict) -> tuple[float | None, str | None]:
+    """Current market cap from explicit GMGN trending fields only; no price*supply inference."""
+    for key in MARKET_CAP_FIELD_ORDER:
+        market_cap = _num_or_none(row.get(key))
+        if market_cap is not None and market_cap > 0:
+            return market_cap, key
+    return None, None
+
 def _clamp(x, lo=0.0, hi=1.0) -> float:
     return lo if x < lo else hi if x > hi else x
 
@@ -846,7 +863,8 @@ def _security_unsafe(sec: dict, chain: str) -> str | None:
 @dataclass
 class TokenFeatures:
     address: str; symbol_raw: str; symbol_safe: str
-    price: float; mcap: float; vol_1h: float; age_min: float; chg_1h: float
+    price: float; mcap: float | None; vol_1h: float; age_min: float; chg_1h: float
+    mcap_source: str | None = None
     # 动能（趋势跟随）
     chg_5m: float = 0.0; buys: int = 0; sells: int = 0; swaps: int = 0
     liquidity: float = 0.0; buy_ratio: float = 0.5; turnover: float = 0.0
@@ -876,12 +894,12 @@ class FeatureExtractor:
         degen = int(_f(row.get("smart_degen_count")))
         renowned = int(_f(row.get("renowned_count")))
         buys = int(_f(row.get("buys"))); sells = int(_f(row.get("sells")))
-        mcap = _f(row.get("market_cap")); vol = _f(row.get("volume"))
+        mcap, mcap_source = _market_cap_from_trending(row); vol = _f(row.get("volume"))
         buy_ratio = buys / (buys + sells) if (buys + sells) > 0 else 0.5
-        turnover = vol / mcap if mcap > 0 else 0.0
+        turnover = vol / mcap if mcap and mcap > 0 else 0.0
         return TokenFeatures(
             address=row["address"], symbol_raw=raw, symbol_safe=sanitize(raw),
-            price=_f(row.get("price")), mcap=mcap,
+            price=_f(row.get("price")), mcap=mcap, mcap_source=mcap_source,
             vol_1h=vol, age_min=age_min,
             # trending 的 price_change_percent1h 是百分比数值(46.96=+46.96%)，/100 统一为小数
             chg_1h=_f(row.get("price_change_percent1h")) / 100.0,
@@ -1652,7 +1670,7 @@ def _feat(f):
                 smart_degen=f.smart_degen, renowned=f.renowned, sm_confluence=f.sm_confluence,
                 sniper_count=f.sniper_count, chg_1h=round(f.chg_1h, 3), chg_5m=round(f.chg_5m, 3),
                 buy_ratio=round(f.buy_ratio, 2), turnover=round(f.turnover, 2),
-                liquidity=f.liquidity, mcap=f.mcap, age_min=round(f.age_min, 1),
+                liquidity=f.liquidity, mcap=f.mcap, mcap_source=f.mcap_source, age_min=round(f.age_min, 1),
                 # dev 评估维度（仅查过 dev 历史的幸存者非空）
                 dev_score=(round(f.dev_eval, 2) if f.dev_eval is not None else None),
                 dev_launches=(f.dev.get("analyzed") if f.dev else None),     # 历史发币(分析的币数)

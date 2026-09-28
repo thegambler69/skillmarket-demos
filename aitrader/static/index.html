@@ -467,7 +467,7 @@ td{padding:5px 10px;vertical-align:middle}
         <div class="body">
           <table>
             <thead><tr>
-              <th><span data-i18n="th_token">TOKEN</span> <span class="tokf" id="tokFilter"></span></th><th data-i18n="th_pipe">规则→排序→LLM</th><th data-i18n="th_safe">安全</th><th data-i18n="th_bund">捆绑</th><th data-i18n="th_dev">DEV</th><th data-i18n="th_t10">前10</th><th data-i18n="th_smart">聪明钱/KOL</th><th data-i18n="th_devhist">DEV史</th><th data-i18n="th_timing">时机</th><th>LLM</th><th data-i18n="th_pri">优先级</th><th data-i18n="th_dec">决策</th>
+              <th><span data-i18n="th_token">TOKEN</span> <span class="tokf" id="tokFilter"></span></th><th data-i18n="th_mcap">市值</th><th data-i18n="th_pipe">规则→排序→LLM</th><th data-i18n="th_safe">安全</th><th data-i18n="th_bund">捆绑</th><th data-i18n="th_dev">DEV</th><th data-i18n="th_t10">前10</th><th data-i18n="th_smart">聪明钱/KOL</th><th data-i18n="th_devhist">DEV史</th><th data-i18n="th_timing">时机</th><th>LLM</th><th data-i18n="th_pri">优先级</th><th data-i18n="th_dec">决策</th>
             </tr></thead>
             <tbody id="rows"></tbody>
           </table>
@@ -627,7 +627,7 @@ const I18N={
     amt_title:'买入数量（原生代币），改这里下面所有买入按钮同步',
     amt_lbl:'买入',
     pipegear_title:'热榜命令 / 轮询间隔',
-    th_token:'TOKEN', th_pipe:'规则→排序→LLM', th_safe:'安全', th_bund:'捆绑', th_dev:'DEV', th_t10:'前10', th_smart:'聪明钱/KOL', th_devhist:'DEV评分', th_timing:'时机', th_pri:'优先级', th_dec:'决策',
+    th_token:'TOKEN', th_mcap:'市值', th_pipe:'规则→排序→LLM', th_safe:'安全', th_bund:'捆绑', th_dev:'DEV', th_t10:'前10', th_smart:'聪明钱/KOL', th_devhist:'DEV评分', th_timing:'时机', th_pri:'优先级', th_dec:'决策',
     log_h3:'实时决策日志 · trade_decisions.jsonl',
     logtog_title:'展开 / 收起',
     esc_h3:'持仓逃生监控',
@@ -673,6 +673,7 @@ const I18N={
     crowdtip_fading:'阴跌：1h 与 5m 双跌，趋势向下（已被 LLM 判 reject）',
     crowd_none_tip:'未进入 LLM 阶段（更早的闸门已筛掉）',
     timing_label:'入场时机',
+    mcap_tip:(src)=>`当前市值　|　来源：GMGN trending ${src||'market_cap'}；缺失显示 N/A，不用价格×供应量推算`,
     llmtip_pass:'通过：动能向上、买盘占优，纳入待决策', llmtip_watch:'观望：动能/买盘不够强，未达买入线', llmtip_reject:'否决：阴跌或不符合趋势条件',
     llm_none_tip:'LLM 阶段　|　未进入 LLM（更早的闸门已筛掉）',
     smc_tip:(degen,kol,smc)=>`聪明钱/KOL　|　${degen} 个聪明钱(smart_degen) / ${kol} 个知名KOL(renowned)，合计 ${smc}`,
@@ -790,7 +791,7 @@ const I18N={
     amt_title:'Buy amount (native token); changing it syncs every buy button below',
     amt_lbl:'BUY',
     pipegear_title:'Trending command / poll interval',
-    th_token:'TOKEN', th_pipe:'RULE→RANK→LLM', th_safe:'SAFE', th_bund:'BUND', th_dev:'DEV', th_t10:'T10', th_smart:'SMART/KOL', th_devhist:'DEV Score', th_timing:'TIMING', th_pri:'PRIORITY', th_dec:'DECISION',
+    th_token:'TOKEN', th_mcap:'MC', th_pipe:'RULE→RANK→LLM', th_safe:'SAFE', th_bund:'BUND', th_dev:'DEV', th_t10:'T10', th_smart:'SMART/KOL', th_devhist:'DEV Score', th_timing:'TIMING', th_pri:'PRIORITY', th_dec:'DECISION',
     log_h3:'Live Decision Log · trade_decisions.jsonl',
     logtog_title:'Expand / collapse',
     esc_h3:'Position Escape Monitor',
@@ -836,6 +837,7 @@ const I18N={
     crowdtip_fading:'Fading: both 1h and 5m down, trend down (LLM rejected)',
     crowd_none_tip:'Did not reach the LLM stage (cut by an earlier gate)',
     timing_label:'Entry timing',
+    mcap_tip:(src)=>`Current market cap　|　source: GMGN trending ${src||'market_cap'}; missing shows N/A, never price × supply inference`,
     llmtip_pass:'Pass: momentum up, buyers dominant—added to pending', llmtip_watch:'Watch: momentum/buying not strong enough, below buy line', llmtip_reject:'Reject: fading or fails trend conditions',
     llm_none_tip:'LLM stage　|　did not reach the LLM (cut by an earlier gate)',
     smc_tip:(degen,kol,smc)=>`Smart money/KOL　|　${degen} smart_degen / ${kol} renowned KOL, total ${smc}`,
@@ -1020,6 +1022,7 @@ function switchChain(ch){
 const shortCA=a=>a?(a.length>11?a.slice(0,5)+'…'+a.slice(-4):a):'';
 const fmtPrice=v=>{if(!v)return '';const n=Number(v);return '$'+(n>=1?n.toFixed(4):n.toPrecision(3));};
 const fmtMc=v=>{const n=Number(v)||0;if(n<=0)return '—';if(n>=1e9)return '$'+(n/1e9).toFixed(1)+'B';if(n>=1e6)return '$'+(n/1e6).toFixed(1)+'M';if(n>=1e3)return '$'+(n/1e3).toFixed(0)+'k';return '$'+n.toFixed(0);};
+const fmtScanMc=v=>{const n=Number(v);if(v==null||!Number.isFinite(n)||n<=0)return 'N/A';if(n>=1e9)return '$'+(n/1e9).toFixed(n>=1e10?0:1)+'B';if(n>=1e6)return '$'+(n/1e6).toFixed(n>=1e7?0:1)+'M';if(n>=1e3)return '$'+(n/1e3).toFixed(n>=1e5?0:1)+'K';return '$'+n.toFixed(0);};
 /* DEV史 列：dev 历史评估（排序子分）。score 0..1 → 标签+0..100 分；hover 出历史最佳市值/发币次数/是否清仓。
    仅对排序靠前的幸存者评估过（其余为 null）→ 显示 — */
 function devCell(t){
@@ -1150,6 +1153,7 @@ function normalize(data){
       hp:!!f.honeypot,ren:(f.renounced!==undefined?!!f.renounced:!!f.renounced_mint),
       bund:f.bundler||0,dev:f.dev_hold||0,top10:f.top10||0,
       smc:f.sm_confluence||0,degen:f.smart_degen||0,kol:f.renowned||0,age:f.age_min,crowd:v.crowdedness||'-',
+      mcap:(f.mcap==null?null:Number(f.mcap)),mcapSource:f.mcap_source||'market_cap',
       devScore:(f.dev_score==null?null:f.dev_score),devLaunches:(f.dev_launches==null?null:f.dev_launches),devAlive:(f.dev_alive==null?null:f.dev_alive),devRugged:(f.dev_rugged==null?null:f.dev_rugged),devRugRate:(f.dev_rug_rate==null?null:f.dev_rug_rate),devInner:(f.dev_inner_count==null?null:f.dev_inner_count),devSurv:(f.dev_survival==null?null:f.dev_survival),devSecUnsafe:(f.dev_sec_unsafe==null?null:f.dev_sec_unsafe),devSecChecked:(f.dev_sec_checked==null?null:f.dev_sec_checked),devSecRisks:(f.dev_sec_risks||[]),devAth:(f.dev_ath_mc==null?0:f.dev_ath_mc),devExited:!!f.dev_exited,devReskin:!!f.dev_reskin,
       v:v.verdict||'-',conv:v.conviction||0,status:isAct?'action':'reject',
       warn:!!dec.risk_warn,size:dec.size_sol||0,died:deriveDied(dec.action,dec.reason),
@@ -1226,9 +1230,9 @@ function renderRows(){
   const box=document.getElementById('rows');
   if(!rows.length){
     if(loadingScreen){
-      box.innerHTML=Array.from({length:6},()=>'<tr class="skelrow"><td colspan="12"><div class="skel-bar"></div></td></tr>').join('');
+      box.innerHTML=Array.from({length:6},()=>'<tr class="skelrow"><td colspan="13"><div class="skel-bar"></div></td></tr>').join('');
     }else{
-      box.innerHTML='<tr><td colspan="12" style="padding:26px;text-align:center;color:var(--dim2)">'+(onlyHeld?t('empty_onlyheld'):t('empty_none'))+'</td></tr>';
+      box.innerHTML='<tr><td colspan="13" style="padding:26px;text-align:center;color:var(--dim2)">'+(onlyHeld?t('empty_onlyheld'):t('empty_none'))+'</td></tr>';
     }
     return;
   }
@@ -1249,6 +1253,7 @@ function renderRows(){
     const radar=hasPos?`<span class="radar" data-tip="${t2('radar_tip')}"></span>`:'';
     return `<tr data-i="${t._i}" class="${t._i===sel?'sel':''} ${t.status==='action'?'act':''}" style="--rc:${rc}">
       <td><span class="sym"><span class="tk" onclick="event.stopPropagation();copyTicker(this)" title="${t2('tk_copy_title')}">${t.sym}</span>${radar}${t.inj?`<span class="inj" data-tip="${t2('inj_tip')}">${t2('inj_label')}</span>`:''}${caCell(t)}</span></td>
+      <td><span class="m has-tip ${t.mcap==null?'dim':''}" data-tip="${t2('mcap_tip',t.mcapSource)}">${fmtScanMc(t.mcap)}</span></td>
       <td><div class="gates">${gates}</div></td>
       <td><span class="m ${t.hp?'bad':!t.ren?'warn':''}">${t.hp?t2('safe_honeypot'):t.ren?t2('safe_renounced'):t2('safe_not_renounced')}</span></td>
       <td><span class="m ${t.bund>.30?'bad':''}">${P(t.bund)}</span></td>
