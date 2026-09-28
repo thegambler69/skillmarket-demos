@@ -141,6 +141,12 @@ LIVE_TRADING_DISABLED = True
 #   3) 持仓不对外（用户选定：公开页只展示筛选列表，不广播本机真实持仓）。
 # 仍只绑 127.0.0.1，公网暴露请走带鉴权/限频的隧道（cloudflared / ngrok）在外层完成。
 PUBLIC_DEMO = os.getenv("PUBLIC_DEMO", "").strip().lower() in ("1", "true", "yes", "on")
+# Preview/worktree safety: set AITRADER_BACKGROUND_COLLECTORS=0 to run the
+# dashboard without starting duplicate Smart Money / market polling processes.
+# Default remains enabled for the normal single-backend deployment.
+BACKGROUND_COLLECTORS_ENABLED = os.getenv(
+    "AITRADER_BACKGROUND_COLLECTORS", "1"
+).strip().lower() not in ("0", "false", "no", "off")
 
 # 热榜扫描命令（可在前端「筛选结果」齿轮里改）。按链给默认值：
 #   sol 用经调优的命令（含 not_wash_trading 过滤）；其他链先用通用模板（仅换 --chain）。
@@ -3018,6 +3024,8 @@ def index():
 @app.on_event("startup")
 def _maybe_start_public_broadcast():
     global MARKET_COLLECTOR_THREAD
+    if not BACKGROUND_COLLECTORS_ENABLED:
+        return
     # 公开演示模式：启动后台守护线程定时刷新真实筛选缓存（仅此线程触发 CLI）。
     if PUBLIC_DEMO:
         threading.Thread(target=_public_broadcast_loop, daemon=True).start()
