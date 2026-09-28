@@ -36,6 +36,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from research_service import GMGNResearchService, deterministic_risk, normalize_trending
+from discovery_v2 import DiscoveryV2Service
 from research_signals import derive_signals
 from research_storage import ResearchStore
 from smart_money_service import SmartMoneyService, SmartMoneyCollector
@@ -216,6 +217,7 @@ def save_trending_cmds(cmds: dict):
 # trading adapter; credentials stay only in the backend subprocess environment.
 RESEARCH_STORE = ResearchStore(OUT_DIR / "gmgn.db")
 RESEARCH = GMGNResearchService(load_env)
+DISCOVERY_V2 = DiscoveryV2Service(RESEARCH)
 SMART_SETTINGS_DEFAULTS = {
     "smart_money_poll_interval": 60,
     "min_wallet_score": 70,
@@ -2865,6 +2867,89 @@ def api_positions(chain: str = "sol"):
     ch = valid_chain(chain)
     with ST.lock:
         return dict(positions=monitor_positions(ch), portfolio=_portfolio())
+
+@app.get("/api/research/discovery-v2")
+def api_research_discovery_v2():
+    """Budget-safe, read-only candidate discovery.
+
+    An uncached refresh uses at most three serialized GMGN market calls:
+    5m trending, all Trenches lifecycle buckets, and one multi-group signal call.
+    Survivor enrichment is local and consumes zero GMGN budget.
+    """
+    try:
+        payload = DISCOVERY_V2.snapshot()
+    except Exception as exc:
+        if SHARED_GMGN_GUARD.blocked() or "429" in str(exc) or "RATE_LIMITED" in str(exc):
+            _rate_limit_http("Discovery v2 is temporarily rate limited; cached research remains available.")
+        raise HTTPException(502, f"Discovery v2 refresh failed: {str(exc)[:180]}")
+
+    candidates = payload.get("candidates") or []
+    lookup = _survivor_bulk_lookup([row.get("address") for row in candidates if row.get("address")])
+    by_address = {
+        str(launch.get("address")): launch
+        for launch in (lookup.get("launches") or [])
+        if isinstance(launch, dict) and launch.get("address")
+    }
+    for row in candidates:
+        launch = by_address.get(str(row.get("address") or ""))
+        if launch is None:
+            row["survivor"] = {"matched": False if lookup.get("available") else None}
+            continue
+        checkpoints = launch.get("checkpoints") or {}
+        passed = [
+            cp for cp in _SURVIVOR_CHECKPOINT_ORDER
+            if isinstance(checkpoints.get(cp), dict)
+            and checkpoints[cp].get("status") == "PASSED"
+        ]
+        row["survivor"] = {
+            "matched": True,
+            "highest_passed_checkpoint": passed[-1] if passed else None,
+            "passed_checkpoints": passed,
+            "max_survived_ms": launch.get("maxSurvivedMs"),
+            "survival_state": launch.get("survivalState"),
+            "launchpad": launch.get("launchpad"),
+        }
+        if passed:
+            row.setdefault("why", []).insert(0, f"Survived {passed[-1]} (native)")
+
+    payload["survivor"] = {
+        "available": lookup.get("available"),
+        "matched": sum(1 for row in candidates if (row.get("survivor") or {}).get("matched") is True),
+        "gmgn_calls": 0,
+        "error": lookup.get("error"),
+    }
+    payload["safety"] = {
+        "mode": ST.mode,
+        "trading_locked": LIVE_TRADING_DISABLED,
+        "execution": False,
+        "background_polling": False,
+        "max_uncached_gmgn_calls": 3,
+    }
+    payload["request_budget"] = SHARED_GMGN_SCHEDULER.snapshot()
+    return payload
+
+
+@app.get("/api/research/discovery-v2/kline")
+def api_research_discovery_v2_kline(address: str, resolution: str = "5m"):
+    """On-demand chart data. Never runs until a user opens a token detail."""
+    try:
+        payload = DISCOVERY_V2.kline(address, resolution)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except Exception as exc:
+        if SHARED_GMGN_GUARD.blocked() or "429" in str(exc) or "RATE_LIMITED" in str(exc):
+            _rate_limit_http("K-line data is temporarily rate limited.")
+        raise HTTPException(502, "K-line data is temporarily unavailable.")
+    payload["request_budget"] = SHARED_GMGN_SCHEDULER.snapshot()
+    return payload
+
+
+@app.get("/discovery-v2")
+def discovery_v2_page():
+    f = STATIC_DIR / "discovery-v2.html"
+    if f.exists():
+        return FileResponse(str(f))
+    raise HTTPException(404, "Discovery v2 UI is not installed")
 
 # 静态前端（同源，避免 CORS）。把上一版 dashboard 存为 static/index.html
 if STATIC_DIR.exists():
