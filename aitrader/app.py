@@ -2884,6 +2884,59 @@ def api_research_discovery_v2():
         raise HTTPException(502, f"Discovery v2 refresh failed: {str(exc)[:180]}")
 
     candidates = payload.get("candidates") or []
+
+    # Reuse already-collected Smart/KOL events from SQLite. This adds no GMGN
+    # request cost to Discovery and upgrades "flow" from static wallet counts
+    # to recent unique-buyer / qualified-flow evidence when available.
+    try:
+        intel = RESEARCH_STORE.smart_money_intelligence(
+            "sol", since_ts=int(time.time()) - 86400,
+            wallet_type=None, activity_limit=1000,
+        )
+        intel_by_address = {
+            str(token.get("token_address")): token
+            for token in (intel.get("tokens") or [])
+            if isinstance(token, dict) and token.get("token_address")
+        }
+    except Exception:
+        intel_by_address = {}
+
+    for row in candidates:
+        token = intel_by_address.get(str(row.get("address") or ""))
+        if not token:
+            row["flow_provenance"] = "market_signal_and_trending_counts"
+            continue
+        w15 = (token.get("windows") or {}).get("15m") or {}
+        unique_buyers = int(w15.get("unique_buyers") or 0)
+        unique_sellers = int(w15.get("unique_sellers") or 0)
+        smart_buyers = int(w15.get("smart_buyers") or 0)
+        kol_buyers = int(w15.get("kol_buyers") or 0)
+        qualified_flow = float(w15.get("qualified_net_flow_usd") or 0.0)
+        observed_flow = float(w15.get("observed_net_flow_usd") or 0.0)
+        convergence = bool(w15.get("smart_kol_convergence"))
+        row["flow_detail"] = {
+            "window": "15m",
+            "unique_buyers": unique_buyers,
+            "unique_sellers": unique_sellers,
+            "smart_buyers": smart_buyers,
+            "kol_buyers": kol_buyers,
+            "qualified_net_flow_usd": qualified_flow,
+            "observed_net_flow_usd": observed_flow,
+            "convergence": convergence,
+            "buyer_acceleration": w15.get("buyer_acceleration"),
+            "newly_observed_buyers": int(w15.get("newly_observed_buyers") or 0),
+        }
+        row["flow_provenance"] = "persisted_smart_kol_events"
+        if convergence and unique_buyers >= 2 and qualified_flow > 0:
+            row["flow"] = "STRONG"
+            row.setdefault("why", []).append(
+                f"{unique_buyers} independent Smart/KOL buyers (15m)"
+            )
+        elif unique_buyers >= 1 and qualified_flow > 0:
+            row["flow"] = "MEDIUM"
+        elif qualified_flow < 0 or unique_sellers > unique_buyers:
+            row["flow"] = "WEAK"
+
     lookup = _survivor_bulk_lookup([row.get("address") for row in candidates if row.get("address")])
     by_address = {
         str(launch.get("address")): launch
